@@ -1,0 +1,21 @@
+{
+  "name": "qq-miniapp-auth",
+  "version": "0.1.0",
+  "private": true,
+  "description": "NapCat account status and QQ mini-app login bridge web console",
+  "type": "module",
+  "scripts": {
+    "start": "node start-all.js",
+    "start:web": "node server.js",
+    "start:bridge": "node bridge.js",
+    "dev": "node --watch server.js",
+    "test": "node --test"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "dependencies": {
+    "dotenv": "^16.4.7",
+    "qrcode": "^1.5.4"
+  }
+}

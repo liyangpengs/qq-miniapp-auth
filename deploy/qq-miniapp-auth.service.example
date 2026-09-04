@@ -1,0 +1,20 @@
+[Unit]
+Description=QQ Miniapp Auth Web and Bridge
+# Keep exactly one service instance; the NapCat workflow lock is process-local.
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=qqauth
+Group=qqauth
+WorkingDirectory=/opt/qq-miniapp-auth
+EnvironmentFile=/opt/qq-miniapp-auth/.env
+ExecStart=/usr/bin/node /opt/qq-miniapp-auth/start-all.js
+Restart=on-failure
+RestartSec=3
+NoNewPrivileges=true
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target

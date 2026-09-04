@@ -1,0 +1,7 @@
+{
+  "name": "qq-miniapp-openauth",
+  "version": "1.0.0",
+  "description": "Expose QQNT mini-app OpenAuth through a local NapCat plugin route",
+  "main": "index.mjs",
+  "private": true
+}

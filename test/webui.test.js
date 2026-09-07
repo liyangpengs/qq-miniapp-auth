@@ -2,15 +2,23 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import http from "node:http";
 
+let upstreamLoginState = true;
+const signatureHeaders = { "X-API-Signature": "qq-miniapp-auth-default-signing-secret" };
 const upstream = http.createServer(async (request, response) => {
   const body = request.url?.includes("/CheckLoginStatus")
-    ? { code: 0, data: { isLogin: true, qrcodeurl: "https://example.test/qr" } }
+    ? { code: 0, data: { isLogin: upstreamLoginState, qrcodeurl: "https://example.test/qr" } }
     : request.url?.includes("/GetQQLoginQrcode")
       ? { code: 0, data: { qrcode: "https://example.test/qr" } }
       : request.url?.includes("/GetQQLoginInfo")
         ? { code: 0, data: { user_id: 123456, nickname: "测试账号", online: true } }
       : request.url?.includes("/auth/login")
           ? { code: 0, data: { Credential: "credential-from-test" } }
+          : request.url?.includes("/api/miniapp/login/start")
+            ? { taskId: "webui-mini-task", status: "pending" }
+            : request.url?.includes("/api/miniapp/login/status/")
+              ? { status: "success", code: "webui-mini-code", user: { uin: "123456" } }
+              : request.url?.includes("/QQLogin/RestartNapCat")
+                ? (upstreamLoginState = false, { code: 0, data: { message: "restart accepted" } })
           : request.url?.includes("/api/qq/logout")
             ? { ok: true, loggedOut: true, method: "test-offline" }
           : { code: 0, data: null };
@@ -36,28 +44,33 @@ test("uses NapCat WebUI endpoints for QR and current user", async (t) => {
   });
   const base = `http://127.0.0.1:${server.address().port}`;
 
-  const start = await fetch(`${base}/api/login/start`, { method: "POST", body: "{}" });
-  const cookie = String(start.headers.get("set-cookie") || "").split(";", 1)[0];
-  const task = (await start.json()).task;
+  const start = await fetch(`${base}/api/qq/login/qrcode`, { method: "POST", body: "{}", headers: signatureHeaders });
+  const startBody = await start.json();
+  const task = startBody.task;
   assert.equal(start.status, 200);
-  assert.equal(task.mode, "webui-api");
-  assert.equal(task.webuiUrl, undefined);
+  assert.equal("taskId" in startBody, false);
+  assert.equal("status" in startBody, false);
+  assert.equal(task.type, "qq-login");
+  assert.equal(task.mode, undefined);
   assert.match(task.qrImage, /^data:image\/png;base64,/);
 
-  const status = await fetch(`${base}/api/login/status/${task.id}`, { headers: { Cookie: cookie } });
-  const statusBody = await status.json();
-  assert.equal(statusBody.task.status, "success");
-  assert.equal(statusBody.task.user.user_id, 123456);
-
-  const user = await fetch(`${base}/api/user`, { headers: { Cookie: cookie } });
-  assert.equal((await user.json()).user.nickname, "测试账号");
-
-  const miniStart = await fetch(`${base}/api/miniapp/start`, {
+  const status = await fetch(`${base}/api/qq/login/status/`, {
     method: "POST",
-    headers: { Cookie: cookie, "Content-Type": "application/json" },
-    body: JSON.stringify({ appId: "wx_123" })
+    headers: { "Content-Type": "application/json", ...signatureHeaders },
+    body: JSON.stringify({ taskId: task.id })
   });
-  const miniTask = (await miniStart.json()).task;
+  const statusBody = await status.json();
+  assert.equal(statusBody.task.status, "confirmed");
+  assert.equal("user" in statusBody.task, false);
+
+  const miniStart = await fetch(`${base}/api/qq/miniapp/code`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json", ...signatureHeaders },
+    body: JSON.stringify({ appId: "wx_123", taskId: task.id })
+  });
+  const miniBody = await miniStart.json();
   assert.equal(miniStart.status, 200);
-  assert.equal(miniTask.appId, "wx_123");
+  assert.equal(miniBody.ok, true);
+  assert.equal(miniBody.code, "webui-mini-code");
+  assert.equal("task" in miniBody, false);
 });

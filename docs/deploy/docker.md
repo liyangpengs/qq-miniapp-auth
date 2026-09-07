@@ -75,7 +75,7 @@ docker compose logs -f qq-miniapp-auth
 curl http://127.0.0.1:8787/api/health
 ```
 
-浏览器访问 <http://127.0.0.1:8787/>。停止并删除容器：
+服务只提供 API，不提供浏览器前端。停止并删除容器：
 
 ```bash
 docker compose down

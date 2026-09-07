@@ -2,7 +2,7 @@
   "name": "qq-miniapp-auth",
   "version": "0.1.0",
   "private": true,
-  "description": "NapCat account status and QQ mini-app login bridge web console",
+  "description": "NapCat QQ QR login and mini-app authorization API service",
   "type": "module",
   "scripts": {
     "start": "node start-all.js",

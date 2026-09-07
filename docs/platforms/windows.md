@@ -61,7 +61,7 @@ Set-ExecutionPolicy -Scope Process Bypass
 npm start
 ```
 
-打开 <http://127.0.0.1:8787/>。停止时在同一个终端按 `Ctrl+C`，不要直接结束 QQ 进程。
+服务只提供 API，不提供浏览器前端。停止时在同一个终端按 `Ctrl+C`，不要直接结束 QQ 进程。
 
 只启动一份 `npm start`。它会同时启动：
 

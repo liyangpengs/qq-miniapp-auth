@@ -3,6 +3,7 @@ import assert from "node:assert/strict";
 
 process.env.HOST = "127.0.0.1";
 process.env.BRIDGE_URL = "";
+const signatureHeaders = { "X-API-Signature": "qq-miniapp-auth-default-signing-secret" };
 
 const { createServer, validAppId } = await import("../server.js");
 
@@ -24,12 +25,18 @@ test("reports real-only configuration and refuses missing bridge", async (t) => 
   assert.equal(health.status, 200);
   assert.equal((await health.json()).bridgeConfigured, false);
 
-  const start = await fetch(`${base}/api/miniapp/start`, {
+  const frontend = await fetch(`${base}/`);
+  assert.equal(frontend.status, 404);
+
+  const start = await fetch(`${base}/api/qq/miniapp/code`, {
     method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ appId: "wx_123" })
+    headers: { "Content-Type": "application/json", ...signatureHeaders },
+    body: JSON.stringify({ appId: "wx_123", taskId: "missing-login-task" })
   });
-  assert.equal(start.status, 409);
+  assert.equal(start.status, 200);
   const body = await start.json();
-  assert.equal(body.code, "WORKFLOW_REQUIRED");
+  assert.equal(body.ok, false);
+  assert.equal(body.code, "TASK_EXPIRED");
+  assert.equal(body.status, "expired");
+  assert.equal("task" in body, false);
 });

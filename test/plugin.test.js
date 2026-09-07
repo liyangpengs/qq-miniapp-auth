@@ -63,3 +63,38 @@ test("NapCat plugin logs the QQ account out through the native login service", a
   assert.equal(response.body.method, "NodeIKernelLoginService.offline");
   assert.equal(offlineCalls, 1);
 });
+
+test("NapCat plugin falls back to the native wrapper session logout", async () => {
+  const routes = {};
+  let sessionArg;
+  await plugin_init({
+    configPath: "Z:\\qq-miniapp-auth-test-config.json",
+    core: {
+      dataPath: "C:\\NapCat\\data",
+      selfInfo: { uin: "123456", uid: "u-123456" },
+      context: {
+        session: {
+          getNodeMiscService: () => ({}),
+          offLine: async (value) => {
+            sessionArg = value;
+            return { result: 0, errMsg: "success" };
+          }
+        },
+        basicInfoWrapper: {
+          getFullQQVersion: () => "9.9.33",
+          QQVersionAppid: "16"
+        }
+      }
+    },
+    router: { getNoAuth(path, handler) { routes[`GET ${path}`] = handler; }, postNoAuth(path, handler) { routes[`POST ${path}`] = handler; } },
+    logger: { info() {} }
+  });
+  const response = responseStub();
+  await routes["POST /logout"]({ body: {}, headers: {} }, response);
+  assert.equal(response.statusCode, 200);
+  assert.equal(response.body.loggedOut, true);
+  assert.equal(response.body.method, "WrapperSession.offLine");
+  assert.equal(sessionArg.selfUin, "123456");
+  assert.equal(sessionArg.selfUid, "u-123456");
+  assert.equal(sessionArg.desktopPathConfig.account_path, "C:\\NapCat\\data");
+});

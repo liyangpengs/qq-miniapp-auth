@@ -76,7 +76,7 @@ cd /opt/qq-miniapp-auth
 npm start
 ```
 
-访问 <http://127.0.0.1:8787/>，健康检查：
+服务只提供 API，不提供浏览器前端。使用健康检查确认服务已启动：
 
 ```bash
 curl http://127.0.0.1:8787/api/health

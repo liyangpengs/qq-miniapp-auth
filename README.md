@@ -1,30 +1,91 @@
-# QQ Miniapp Auth
+# QQ 小程序授权服务
 
-这是一个连接 NapCat 的真实 QQ 扫码登录和 QQ 小程序授权服务。它提供：
+本项目基于本机 NapCat，提供真实的 QQ 扫码登录和 QQ 小程序 OpenAuth 授权
+接口，不生成模拟二维码或模拟授权码。
 
-- NapCat 生成的 QQ 登录二维码；
-- 登录状态轮询，可区分等待扫码、已扫码、已确认、已取消和过期；
-- 当前登录 QQ 信息获取；
-- 输入小程序 `appId` 后获取真实的 `qq.login` 授权 `code`；
-- 获取 code 后通过 NapCat 原生 `NodeIKernelLoginService.offline()` 注销当前 QQ；
-- 多浏览器访问时的单 NapCat 全局串行锁。
+## 功能
 
-## 运行架构
+- 获取 NapCat 生成的真实 QQ 登录二维码；
+- 轮询 `waiting_scan`、`scanned`、`confirmed`、`cancelled` 和 `expired` 状态；
+- 通过 OneBot 查询当前 QQ 账号信息；
+- 通过 NapCat 插件调用 `NodeMiscService.loginWithAppId(appId)`；
+- 只有 NapCat 原生注销成功后才返回真实的 `qq.login` 授权码；
+- 对没有 `NodeIKernelLoginService.offline()` 的 NapCat 4.18.x 版本，使用
+  `NodeIQQNTWrapperSession.offLine()` 备用方案，并重启 NapCat worker 清理内存中的登录状态；
+- 同一 NapCat 账号一次只允许一个工作流，任务取消、超时或授权码获取成功后自动释放。
 
-项目只负责 Web 服务和 HTTP bridge，QQ/NapCat 仍然运行在宿主机上：
+## 运行结构
 
-| 服务 | 默认地址 | 作用 |
-| --- | --- | --- |
-| Web | `http://127.0.0.1:8787` | 浏览器页面和公开 API |
-| 项目 bridge | `http://127.0.0.1:9010` | 调用 NapCat OpenAuth 插件和注销接口 |
-| NapCat OneBot HTTP | `http://127.0.0.1:3000` | 获取当前 QQ 信息 |
-| NapCat WebUI | `http://127.0.0.1:6099/webui/` | 生成二维码、轮询扫码状态 |
+```text
+API 调用方 -> API :8787 -> 项目 bridge :9010
+                              -> NapCat 插件 :6099
+                              -> NapCat OneBot :3000
+```
 
-`npm start` 会同时启动 Web 和 bridge。不要启动多个项目副本，也不要同时配置多个 NapCat 实例，否则串行锁无法保证。项目不使用 Unix socket、Windows named pipe 或 `.sock` 文件。
+只应对调用方开放 `8787` 端口。`3000`、`6099` 和 `9010` 应保持在本机或受保护的
+内网中。本项目不使用 Unix socket、Windows named pipe 或 `.sock` 文件。
 
-## 按部署方式阅读
+## 安装和配置
 
-先完成 NapCat 安装、插件和 OneBot 配置，再选择一种项目部署方式：
+1. 安装 QQ 和 NapCat，并启用 NapCat WebUI 与 OneBot HTTP Server。
+2. 按对应平台文档安装 `napcat-openauth-plugin`。
+3. 复制 `.env.example` 为 `.env`，填写 NapCat 和插件的 token。
+4. 安装依赖并启动 Web 服务和 bridge：
+
+```bash
+npm ci
+npm start
+```
+
+API 默认地址为 <http://127.0.0.1:8787>，项目不再提供浏览器前端页面。
+
+四个业务接口都要求在 `X-API-Signature` 请求头中传入 `API_SIGNING_SECRET` 配置的固定值。
+默认值为 `qq-miniapp-auth-default-signing-secret`；`/api/health` 不要求签名。
+签名采用普通字符串全等比较，不使用 HMAC、哈希、时间戳或其他加密/签名算法。
+
+任务和工作流的默认有效期都是 2 分钟（`120000` 毫秒）。如需调整，可配置
+`TASK_TTL_MS` 和 `WORKFLOW_TTL_MS`。
+
+## API 快速开始
+
+```http
+POST /api/qq/login/qrcode
+```
+
+响应中的 `task.id` 是后续请求使用的任务标识，不需要 cookie。四个公开业务接口始终
+返回 HTTP `200`，调用方通过 `ok` 字段判断成功或失败。二维码获取和状态查询接口返回
+任务对象，小程序 code 和注销接口只返回操作结果。
+
+```http
+POST /api/qq/login/status
+POST /api/qq/miniapp/code
+POST /api/qq/logout
+```
+
+`POST /api/qq/login/status` 请求体使用 `{"taskId":"..."}` 轮询状态。设置
+`"refresh":true` 可以强制刷新二维码；带结尾斜杠的 `/api/qq/login/status/` 也兼容支持。
+
+对于小程序 code 和注销接口，不存在或已经过期的任务统一返回：
+
+```json
+{"ok":false,"code":"TASK_EXPIRED","status":"expired"}
+```
+
+这两个接口不会返回任务详情、二维码图片或用户信息。
+
+小程序授权接口默认会等待授权完成并执行 QQ 注销：
+
+```http
+POST /api/qq/miniapp/code
+Content-Type: application/json
+
+{"taskId":"{login-task-id}","appId":"1112386029"}
+```
+
+`1112386029` 是经典 QQ 农场小程序的 `appId` 示例。完整请求和响应格式请查看
+[API 文档](docs/api.md)。
+
+## 部署文档
 
 - [NapCat 安装与配置](docs/napcat/install-and-config.md)
 - [Windows 原生部署](docs/platforms/windows.md)
@@ -34,49 +95,11 @@
 - [宝塔部署](docs/deploy/baota.md)
 - [HTTP API 参考](docs/api.md)
 
-Docker 和宝塔文档与 Windows、Linux、macOS 原生文档分开存放。`docs/README.md` 提供目录索引和配置关系图。
-
-## 最小配置
-
-复制 `.env.example` 为 `.env`，至少填写 OneBot token、NapCat WebUI token（或 `NAPCAT_WEBUI_CONFIG`）以及插件 token：
-
-```ini
-HOST=127.0.0.1
-PORT=8787
-NAPCAT_API_URL=http://127.0.0.1:3000
-NAPCAT_TOKEN=你的OneBotToken
-NAPCAT_WEBUI_API_URL=http://127.0.0.1:6099/api
-NAPCAT_WEBUI_CONFIG=NapCat配置目录/webui.json
-NAPCAT_OPEN_AUTH_PLUGIN_URL=http://127.0.0.1:6099/plugin/qq-miniapp-openauth/api
-NAPCAT_OPEN_AUTH_PLUGIN_TOKEN=插件配置中的token
-BRIDGE_URL=http://127.0.0.1:9010
-BRIDGE_PORT=9010
-```
-
-Windows 安装脚本会复制插件并生成或复用插件 token；Linux/macOS 按 NapCat 文档手动复制插件。详细配置不要从 README 猜路径，以对应平台文档为准。
-
-## 快速启动
+## 验证
 
 ```bash
-npm ci
-npm start
+npm test
 ```
 
-打开 `http://127.0.0.1:8787/`。页面会直接显示 NapCat 返回的二维码，不会把浏览器跳转到 NapCat WebUI。健康检查地址为 `GET /api/health`。
-
-## 安全边界
-
-- 生产环境只对外暴露 Web 的 `8787`，不要公开 `3000`、`6099`、`9010`。
-- OneBot、WebUI、插件和 bridge 都应使用 token；反向代理使用 HTTPS。
-- 只运行一个 `start-all.js` 实例，并确保 NapCat 只有一个正在工作的 QQ 账号。
-- 不要修改 QQ 的 `resources/app/package.json`，也不要直接杀 QQ 进程；注销由 NapCat 插件调用原生 `offline()` 完成。
-- `appId` 和授权 code 都是真实值，服务端不会生成 mock 数据。
-
-## 验证顺序
-
-1. NapCat WebUI 可以打开，OneBot HTTP Server 已启用。
-2. 插件状态接口返回 `ready: true` 且包含 `loginWithAppId`。
-3. `GET /api/health` 返回 `bridgeConfigured: true`。
-4. 浏览器创建二维码任务并扫码确认。
-5. 输入小程序 `appId`，轮询任务直到 `status=success`，确认返回 `code` 和 `logoutStatus=success`。
-
+测试使用 HTTP 模拟服务，不会连接真实 NapCat。生产环境需要真实的 NapCat WebUI、
+OneBot 服务和 OpenAuth 插件。

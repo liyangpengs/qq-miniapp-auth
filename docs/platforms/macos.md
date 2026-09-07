@@ -64,7 +64,7 @@ mkdir -p "/实际/NapCat/config/plugins/qq-miniapp-openauth"
 npm start
 ```
 
-浏览器打开 <http://127.0.0.1:8787/>，检查服务：
+服务只提供 API，不提供浏览器前端。使用健康检查确认服务已启动：
 
 ```bash
 curl http://127.0.0.1:8787/api/health
@@ -82,4 +82,3 @@ pm2 save
 - 系统防火墙只需允许本机应用通信；不要把 `3000`、`6099`、`9010` 公开到公网。
 - NapCat 和 Node 服务可以使用不同 macOS 用户，但配置文件和插件目录必须可读。
 - 项目使用 HTTP bridge，不使用 Unix socket，不需要创建 `bridge.sock`。
-

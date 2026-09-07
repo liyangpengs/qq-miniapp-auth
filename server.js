@@ -1,6 +1,5 @@
 import http from "node:http";
 import fsSync from "node:fs";
-import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import crypto from "node:crypto";
@@ -11,9 +10,7 @@ import QRCode from "qrcode";
 dotenv.config();
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
-const publicDir = path.join(__dirname, "public");
 const tasks = new Map();
-const visitorSessions = new Map();
 let activeWorkflow = null;
 let logoutRecoveryRequired = false;
 let logoutRecoveryPromise = null;
@@ -32,19 +29,17 @@ const config = {
   bridgeToken: process.env.BRIDGE_TOKEN || "",
   bridgeMiniStartPath: process.env.BRIDGE_MINIAPP_START_PATH || "/api/miniapp/login/start",
   bridgeMiniStatusPath: process.env.BRIDGE_MINIAPP_STATUS_PATH || "/api/miniapp/login/status",
+  bridgeMiniCancelPath: process.env.BRIDGE_MINIAPP_CANCEL_PATH || "/api/miniapp/login/cancel",
   bridgeLogoutPath: process.env.BRIDGE_LOGOUT_PATH || "/api/qq/logout",
-  workflowTtlMs: numberEnv("WORKFLOW_TTL_MS", 10 * 60 * 1000),
-  sessionTtlMs: numberEnv("SESSION_TTL_MS", 24 * 60 * 60 * 1000),
-  sessionCookieName: process.env.SESSION_COOKIE_NAME || "qqma_session",
-  sessionCookieSameSite: ["Strict", "Lax", "None"].includes(process.env.SESSION_COOKIE_SAMESITE) ? process.env.SESSION_COOKIE_SAMESITE : "Lax",
-  sessionCookieSecure: /^(1|true|yes|on)$/i.test(String(process.env.SESSION_COOKIE_SECURE || "0")),
+  workflowTtlMs: numberEnv("WORKFLOW_TTL_MS", 2 * 60 * 1000),
+  taskTtlMs: numberEnv("TASK_TTL_MS", 2 * 60 * 1000),
+  apiSigningSecret: process.env.API_SIGNING_SECRET || process.env.SIGNING_SECRET || "qq-miniapp-auth-default-signing-secret",
   corsOrigin: process.env.CORS_ORIGIN || "same-origin",
   miniappSecrets: parseSecrets(process.env.MINIAPP_SECRETS || "{}")
 };
 
 let webUiCredential = config.napcatWebUiCredential;
 let loginStartPromise = null;
-let loginStartOwnerSessionId = "";
 
 function numberEnv(name, fallback) {
   const value = Number(process.env[name]);
@@ -53,6 +48,21 @@ function numberEnv(name, fallback) {
 
 function trimSlash(value) {
   return value.replace(/\/+$/, "");
+}
+
+function requiresApiSignature(pathname) {
+  return pathname === "/api/qq/login/qrcode" ||
+    pathname === "/api/qq/login/status" ||
+    pathname === "/api/qq/login/status/" ||
+    pathname === "/api/qq/miniapp/code" ||
+    pathname === "/api/qq/logout";
+}
+
+function verifyApiSignature(request) {
+  const received = String(request.headers["x-api-signature"] || "");
+  if (!received) return { ok: false, code: "SIGNATURE_REQUIRED", error: "X-API-Signature header is required" };
+  if (received !== config.apiSigningSecret) return { ok: false, code: "INVALID_SIGNATURE", error: "Invalid API signature" };
+  return { ok: true };
 }
 
 function parseSecrets(value) {
@@ -136,59 +146,44 @@ function makeId() {
   return crypto.randomBytes(18).toString("hex");
 }
 
-function parseCookies(request) {
-  const header = String(request.headers.cookie || "");
-  const cookies = {};
-  for (const part of header.split(";")) {
-    const index = part.indexOf("=");
-    if (index <= 0) continue;
-    const key = part.slice(0, index).trim();
-    const value = part.slice(index + 1).trim();
-    if (key) {
-      try { cookies[key] = decodeURIComponent(value); } catch { cookies[key] = value; }
+function scheduleTaskExpiry(task) {
+  if (task.expirationTimer) clearTimeout(task.expirationTimer);
+  const delay = Math.max(1, task.expiresAt - Date.now() + 5);
+  task.expirationTimer = setTimeout(() => { void expireTaskIfNeeded(task); }, delay);
+  task.expirationTimer.unref?.();
+}
+
+function removeTaskFromCache(task) {
+  if (!task) return;
+  if (task.expirationTimer) clearTimeout(task.expirationTimer);
+  task.expirationTimer = undefined;
+  if (tasks.get(task.id) === task) tasks.delete(task.id);
+}
+
+function removeTaskAndLinks(task) {
+  if (!task) return;
+  removeTaskFromCache(task);
+  if (task.kind === "napcat-login") {
+    for (const candidate of tasks.values()) {
+      if (candidate.kind === "miniapp-login" && candidate.loginTaskId === task.id) removeTaskFromCache(candidate);
     }
+  } else if (task.kind === "miniapp-login" && task.loginTaskId) {
+    removeTaskFromCache(tasks.get(task.loginTaskId));
   }
-  return cookies;
 }
 
-function createVisitorSession() {
-  const session = { id: makeId(), createdAt: Date.now(), lastSeenAt: Date.now() };
-  visitorSessions.set(session.id, session);
-  return session;
-}
-
-function ensureVisitorSession(request, response) {
-  const cookieName = config.sessionCookieName;
-  const existingId = parseCookies(request)[cookieName];
-  const existing = existingId && visitorSessions.get(existingId);
-  if (existing && Date.now() - existing.lastSeenAt < config.sessionTtlMs) {
-    existing.lastSeenAt = Date.now();
-    return { ...existing, fromCookie: true };
-  }
-  const session = createVisitorSession();
-  const attributes = [
-    `${cookieName}=${encodeURIComponent(session.id)}`,
-    "Path=/",
-    `Max-Age=${Math.floor(config.sessionTtlMs / 1000)}`,
-    "HttpOnly",
-    `SameSite=${config.sessionCookieSameSite}`
-  ];
-  if (config.sessionCookieSecure) attributes.push("Secure");
-  response.setHeader("Set-Cookie", attributes.join("; "));
-  return { ...session, fromCookie: false };
-}
-
-function createTask(kind, values = {}, ownerSessionId) {
+function createTask(kind, values = {}, ownerKey) {
   const task = {
     id: makeId(),
     kind,
     status: "pending",
     createdAt: Date.now(),
-    expiresAt: Date.now() + 5 * 60 * 1000,
-    ownerSessionId,
+    expiresAt: Date.now() + config.taskTtlMs,
+    ownerKey,
     ...values
   };
   tasks.set(task.id, task);
+  scheduleTaskExpiry(task);
   return task;
 }
 
@@ -206,17 +201,22 @@ function makeWorkflowBusyError(workflow = activeWorkflow) {
 
 function expireWorkflowIfNeeded() {
   if (activeWorkflow && activeWorkflow.expiresAt <= Date.now()) {
-    activeWorkflow = null;
+    const loginTask = activeWorkflow.loginTaskId && tasks.get(activeWorkflow.loginTaskId);
+    const miniTask = activeWorkflow.miniappTaskId && tasks.get(activeWorkflow.miniappTaskId);
+    const waitingForRelease = [loginTask, miniTask].some((task) => task &&
+      (["pending", "scanned", "success"].includes(task.status) || ["pending", "failed"].includes(task.logoutStatus))
+    );
+    if (!waitingForRelease) activeWorkflow = null;
   }
   return activeWorkflow;
 }
 
-function acquireWorkflow(ownerSessionId) {
+function acquireWorkflow(ownerKey) {
   const current = expireWorkflowIfNeeded();
-  if (current && current.ownerSessionId !== ownerSessionId) throw makeWorkflowBusyError(current);
+  if (current && current.ownerKey !== ownerKey) throw makeWorkflowBusyError(current);
   if (!current) {
     activeWorkflow = {
-      ownerSessionId,
+      ownerKey,
       phase: "login",
       acquiredAt: Date.now(),
       expiresAt: Date.now() + config.workflowTtlMs,
@@ -227,7 +227,7 @@ function acquireWorkflow(ownerSessionId) {
   return activeWorkflow;
 }
 
-function requireWorkflowOwner(ownerSessionId) {
+function requireWorkflowOwner(ownerKey) {
   const current = expireWorkflowIfNeeded();
   if (!current) {
     const error = new Error("请先创建 QQ 扫码登录任务");
@@ -235,37 +235,37 @@ function requireWorkflowOwner(ownerSessionId) {
     error.code = "WORKFLOW_REQUIRED";
     throw error;
   }
-  if (current.ownerSessionId !== ownerSessionId) throw makeWorkflowBusyError(current);
+  if (current.ownerKey !== ownerKey) throw makeWorkflowBusyError(current);
   current.expiresAt = Date.now() + config.workflowTtlMs;
   return current;
 }
 
-function releaseWorkflow(ownerSessionId) {
-  if (!activeWorkflow || (ownerSessionId && activeWorkflow.ownerSessionId !== ownerSessionId)) return;
+function releaseWorkflow(ownerKey) {
+  if (!activeWorkflow || (ownerKey && activeWorkflow.ownerKey !== ownerKey)) return;
   activeWorkflow = null;
 }
 
 function publicTask(task) {
   if (!task) return null;
+  const login = task.kind === "napcat-login";
+  const status = login ? loginState(task) : task.status;
   return {
     id: task.id,
-    kind: task.kind,
+    type: login ? "qq-login" : "miniapp-code",
     appId: task.appId,
-    status: task.status,
-    mode: task.mode,
+    loginTaskId: task.loginTaskId,
+    status,
     qrUrl: task.qrUrl,
     qrImage: task.qrImage,
-    user: task.user,
-    code: task.code,
-    error: task.error,
+    code: !login && task.status === "success" && task.logoutStatus === "success" ? task.code : undefined,
     scanned: task.scanned,
     confirmed: task.confirmed,
     cancelled: task.cancelled,
     logoutStatus: task.logoutStatus,
     logoutMethod: task.logoutMethod,
     logoutError: task.logoutError,
-    released: task.logoutStatus === "success" || task.released === true,
-    state: task.kind === "napcat-login" ? loginState(task) : task.status,
+    released: task.released === true,
+    error: task.error,
     expiresAt: task.expiresAt
   };
 }
@@ -280,12 +280,52 @@ function loginState(task) {
   return "waiting_scan";
 }
 
+function expiredTaskPayload(taskId, type) {
+  return {
+    id: typeof taskId === "string" && taskId.trim() ? taskId : undefined,
+    type,
+    status: "expired",
+    cancelled: true,
+    released: true,
+    error: "Task not found or expired",
+    expiresAt: Date.now()
+  };
+}
+
+function taskResponseOk(task) {
+  return Boolean(task) && !["expired", "failed", "login_required"].includes(task.status);
+}
+
 function normalizeBridgeResult(value) {
   if (!value || typeof value !== "object") return {};
   if (value.data && typeof value.data === "object" && !Array.isArray(value.data)) {
     return { ...value, ...value.data };
   }
   return value;
+}
+
+function normalizeWebUiResult(value) {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return value;
+  const result = { ...value };
+  const merge = (candidate) => {
+    if (candidate && typeof candidate === "object" && !Array.isArray(candidate)) Object.assign(result, candidate);
+  };
+  merge(value.data);
+  merge(value.result);
+  merge(value.data?.result);
+  return result;
+}
+
+function resultCandidates(value) {
+  if (!value || typeof value !== "object") return [value];
+  return [value, value.data, value.result, value.data?.result].filter((candidate) => candidate && typeof candidate === "object");
+}
+
+function firstResultField(value, names) {
+  for (const candidate of resultCandidates(value)) {
+    for (const name of names) if (candidate[name] !== undefined && candidate[name] !== null) return candidate[name];
+  }
+  return undefined;
 }
 
 function joinUrl(base, requestPath) {
@@ -380,7 +420,7 @@ async function webUiCall(action, params = {}) {
         error.payload = payload;
         throw error;
       }
-      return payload?.data ?? payload;
+      return normalizeWebUiResult(payload);
     } catch (error) {
       lastError = error;
       const unauthorized = /unauthorized|credential|凭证|认证/i.test(`${error.message} ${error.payload?.message || ""}`);
@@ -419,9 +459,9 @@ async function makeQrImage(value) {
   return QRCode.toDataURL(qr, { margin: 1, width: 280 });
 }
 
-function createLoginTask(ownerSessionId, values = {}) {
-  const task = createTask("napcat-login", values, ownerSessionId);
-  if (activeWorkflow && activeWorkflow.ownerSessionId === ownerSessionId) {
+function createLoginTask(ownerKey, values = {}) {
+  const task = createTask("napcat-login", values, ownerKey);
+  if (activeWorkflow && activeWorkflow.ownerKey === ownerKey) {
     activeWorkflow.loginTaskId = task.id;
     activeWorkflow.phase = task.status === "success" ? "awaiting_code" : "login";
     activeWorkflow.expiresAt = Math.max(activeWorkflow.expiresAt, task.expiresAt);
@@ -429,41 +469,34 @@ function createLoginTask(ownerSessionId, values = {}) {
   return task;
 }
 
-async function loginStart(ownerSessionId) {
-  const current = expireWorkflowIfNeeded();
-  if (current && current.ownerSessionId !== ownerSessionId) throw makeWorkflowBusyError(current);
-  if (current?.loginTaskId) {
-    const task = tasks.get(current.loginTaskId);
-    if (task && task.expiresAt > Date.now() && ["pending", "scanned", "success"].includes(task.status)) return task;
-    if (task && ["cancelled", "expired", "failed"].includes(task.status)) releaseWorkflow(ownerSessionId);
-  }
-  if (loginStartPromise) {
-    if (loginStartOwnerSessionId !== ownerSessionId) throw makeWorkflowBusyError(activeWorkflow);
-    return loginStartPromise;
-  }
+async function loginStart() {
+  const ownerKey = makeId();
   await ensureLogoutRecovery();
-  acquireWorkflow(ownerSessionId);
-  const operation = loginStartInternal(ownerSessionId);
+  const current = expireWorkflowIfNeeded();
+  if (current) throw makeWorkflowBusyError(current);
+  if (loginStartPromise) {
+    throw makeWorkflowBusyError(activeWorkflow);
+  }
+  acquireWorkflow(ownerKey);
+  const operation = loginStartInternal(ownerKey);
   loginStartPromise = operation;
-  loginStartOwnerSessionId = ownerSessionId;
   try {
     return await operation;
   } catch (error) {
-    releaseWorkflow(ownerSessionId);
+    releaseWorkflow(ownerKey);
     throw error;
   } finally {
     if (loginStartPromise === operation) {
       loginStartPromise = null;
-      loginStartOwnerSessionId = "";
     }
   }
 }
 
-async function loginStartInternal(ownerSessionId) {
+async function loginStartInternal(ownerKey) {
   if (!isWebUiConfigured()) {
     const qrImage = readNapcatQrImage();
     if (qrImage) {
-      const task = createLoginTask(ownerSessionId, { mode: "napcat-file", qrImage });
+      const task = createLoginTask(ownerKey, { mode: "napcat-file", qrImage });
       try {
         const user = await napcatCall("get_login_info");
         if (hasLoggedInUser(user)) {
@@ -477,18 +510,23 @@ async function loginStartInternal(ownerSessionId) {
     }
     try {
       const user = await napcatCall("get_login_info");
-      if (hasLoggedInUser(user)) return createLoginTask(ownerSessionId, { mode: "onebot", status: "success", user });
+      if (hasLoggedInUser(user)) return createLoginTask(ownerKey, { mode: "onebot", status: "success", user });
     } catch {
       // Fall through to the actionable configuration error below.
     }
     throw new Error("NapCat QR login is not configured. Set NAPCAT_WEBUI_TOKEN/NAPCAT_WEBUI_CONFIG or NAPCAT_QR_IMAGE_PATH, then retry.");
   }
   try {
+    try {
+      await webUiCall("/QQLogin/RefreshQRcode");
+    } catch {
+      // Older NapCat versions may create a fresh QR directly from the getter.
+    }
     const result = await webUiCall("/QQLogin/GetQQLoginQrcode");
     const qrValue = pickQrValue(result);
     const qrImage = await makeQrImage(qrValue);
     if (!qrImage) throw new Error("NapCat WebUI did not return a usable QR code");
-    return createLoginTask(ownerSessionId, {
+    return createLoginTask(ownerKey, {
       mode: "webui-api",
       qrUrl: /^https?:\/\//i.test(String(qrValue || "")) ? qrValue : undefined,
       qrImage
@@ -497,7 +535,7 @@ async function loginStartInternal(ownerSessionId) {
     // 已经登录时 GetQQLoginQrcode 会返回错误，继续读取当前账号。
     try {
       const user = await webUiCall("/QQLogin/GetQQLoginInfo");
-      if (hasLoggedInUser(user)) return createLoginTask(ownerSessionId, { mode: "webui-api", status: "success", user });
+      if (hasLoggedInUser(user)) return createLoginTask(ownerKey, { mode: "webui-api", status: "success", user });
       throw error;
     } catch {
       throw error;
@@ -506,54 +544,75 @@ async function loginStartInternal(ownerSessionId) {
 }
 
 function mapStatus(result) {
-  const status = String(result.status || result.state || "pending").toLowerCase();
+  const status = String(firstResultField(result, ["status", "state", "loginStatus", "login_state"]) || "pending").trim().toLowerCase();
   if (["ok", "success", "succeeded", "logged_in", "connected"].includes(status)) return "success";
   if (["login_required", "not_logged_in", "unauthenticated"].includes(status)) return "login_required";
   if (["failed", "error", "rejected"].includes(status)) return "failed";
-  if (["expired", "timeout", "cancelled", "canceled"].includes(status)) return "expired";
+  if (["cancelled", "canceled"].includes(status)) return "cancelled";
+  if (["expired", "timeout"].includes(status)) return "expired";
   return "pending";
 }
 
 function truthyField(value, names) {
   for (const name of names) {
-    if (value?.[name] === true || value?.[name] === 1 || String(value?.[name] || "").toLowerCase() === "true") return true;
+    const field = firstResultField(value, [name]);
+    if (field === true || field === 1 || String(field || "").trim().toLowerCase() === "true") return true;
   }
   return false;
 }
 
+function booleanField(value, names) {
+  const field = firstResultField(value, names);
+  if (field === true || field === 1) return true;
+  if (field === false || field === 0) return false;
+  const text = String(field || "").trim().toLowerCase();
+  if (["true", "yes", "on", "logged_in", "success"].includes(text)) return true;
+  if (["false", "no", "off", "not_logged_in", "pending"].includes(text)) return false;
+  return undefined;
+}
+
 function applyLoginStatus(task, result) {
-  const state = String(result?.status || result?.state || "").toLowerCase();
-  const message = String(result?.loginError || result?.error || result?.message || "").toLowerCase();
+  const state = String(firstResultField(result, ["status", "state", "loginStatus", "login_state", "qrcodeStatus", "scanStatus"]) || "").trim().toLowerCase();
+  const message = String(firstResultField(result, ["loginError", "error", "message", "msg", "wording"]) || "").trim().toLowerCase();
+  const isLogin = booleanField(result, ["isLogin", "is_login", "loggedIn", "logged_in"]);
+  const expired = ["expired", "timeout"].includes(state) || /expired|timeout|二维码.*过期|已过期|失效/.test(`${state} ${message}`);
   const cancelled = truthyField(result, ["cancelled", "canceled", "isCancelled", "isCanceled", "userCancelled", "userCanceled"]) ||
     /cancel|取消|拒绝|rejected/.test(`${state} ${message}`);
-  const scanned = truthyField(result, ["scanned", "isScanned", "isScan", "scan", "hasScan", "hasScanned", "qrcodeScanned"]) ||
-    /scan|已扫|扫码|confirm|确认/.test(`${state} ${message}`);
-  const confirmed = truthyField(result, ["confirmed", "isConfirmed", "isConfirm", "confirm", "hasConfirm", "authorized", "isAuthorized"]) || state === "confirmed";
-  task.scanned = task.scanned || scanned || confirmed || Boolean(result?.isLogin);
-  task.confirmed = task.confirmed || confirmed || Boolean(result?.isLogin) || state === "success" || state === "logged_in";
+  const waitingScan = /waiting[_\s-]?scan|wait[_\s-]?for[_\s-]?scan|等待扫码|待扫码|未扫码/.test(`${state} ${message}`);
+  const explicitScanned = truthyField(result, ["scanned", "isScanned", "isScan", "scan", "hasScan", "hasScanned", "qrcodeScanned", "qrScanned", "scanSuccess", "isScanSuccess"]) ||
+    /scanned|scanning|qrcode[_\s-]?scanned|scan[_\s-]?(success|complete|completed)|已扫码|扫码成功/.test(`${state} ${message}`);
+  const scanned = explicitScanned ||
+    (!waitingScan && /scanned|scanning|qrcode[_\s-]?scanned|scan[_\s-]?(success|complete|completed)|(?:^|[_\s-])scan(?:$|[_\s-])|已扫码|扫码成功|待确认|等待确认|confirm/.test(`${state} ${message}`));
+  const confirmed = truthyField(result, ["confirmed", "isConfirmed", "isConfirm", "confirm", "hasConfirm", "authorized", "isAuthorized"]) ||
+    ["confirmed", "success", "succeeded", "logged_in", "connected"].includes(state) || isLogin === true;
+  task.scanned = task.scanned || scanned || confirmed;
+  task.confirmed = task.confirmed || confirmed;
   task.cancelled = task.cancelled || cancelled;
-  task.error = result?.loginError || result?.error || result?.message || task.error;
-  if (cancelled) task.status = "cancelled";
-  else if (result?.isLogin || state === "success" || state === "logged_in") task.status = "success";
+  task.error = firstResultField(result, ["loginError", "error", "message", "msg", "wording"]) || task.error;
+  if (expired) task.status = "expired";
+  else if (cancelled) task.status = "cancelled";
+  else if (task.confirmed || isLogin === true) task.status = "success";
   else if (scanned || confirmed || task.scanned) task.status = "scanned";
   else task.status = "pending";
   return task;
 }
 
 async function loginStatus(task) {
-  if (task.expiresAt < Date.now() && ["pending", "scanned"].includes(task.status)) task.status = "expired";
+  await expireTaskIfNeeded(task);
   if (["pending", "scanned"].includes(task.status)) {
     try {
       if (task.mode === "webui-api") {
         const result = await webUiCall("/QQLogin/CheckLoginStatus");
         applyLoginStatus(task, result);
-        task.user = result?.isLogin ? await webUiCall("/QQLogin/GetQQLoginInfo") : task.user;
-        const nextQrValue = result?.qrcodeurl || result?.qrcode || result?.qrUrl || task.qrUrl;
+        if (task.status === "success" || booleanField(result, ["isLogin", "is_login", "loggedIn", "logged_in"]) === true) {
+          task.user = await webUiCall("/QQLogin/GetQQLoginInfo");
+        }
+        const nextQrValue = firstResultField(result, ["qrcodeurl", "qrcode", "qrUrl", "qr_url", "qrCode", "qr_code"]) || task.qrUrl;
         if (nextQrValue && nextQrValue !== task.qrUrl) {
           task.qrUrl = /^https?:\/\//i.test(String(nextQrValue)) ? nextQrValue : task.qrUrl;
           try { task.qrImage = await makeQrImage(nextQrValue); } catch { /* ignore */ }
         }
-        task.error = result?.loginError;
+        task.error = firstResultField(result, ["loginError", "error", "message", "msg", "wording"]) || task.error;
       } else if (task.mode === "napcat-file") {
         task.qrImage = readNapcatQrImage() || task.qrImage;
         const user = await napcatCall("get_login_info");
@@ -575,8 +634,20 @@ async function loginStatus(task) {
       // In WebUI mode an unavailable or not-yet-logged-in NapCat stays pending.
     }
   }
+  if (task.status === "expired") {
+    await cancelTask(task, task.error || "二维码已过期，请刷新", { expired: true });
+  } else if (task.status === "cancelled") {
+    await cancelTask(task, task.error || "登录任务已取消");
+  }
   if (task.id === activeWorkflow?.loginTaskId) {
-    if (["cancelled", "expired", "failed"].includes(task.status)) releaseWorkflow(task.ownerSessionId);
+    if (["cancelled", "expired", "failed"].includes(task.status) && !["pending", "failed"].includes(task.logoutStatus)) {
+      if (task.status === "cancelled") {
+        task.cancelled = true;
+        task.released = true;
+        task.logoutStatus = task.logoutStatus || "not_required";
+      }
+      releaseWorkflow(task.ownerKey);
+    }
     else if (task.status === "success") {
       activeWorkflow.phase = "awaiting_code";
       activeWorkflow.expiresAt = Date.now() + config.workflowTtlMs;
@@ -591,7 +662,7 @@ async function refreshLogin(task) {
     error.status = 404;
     throw error;
   }
-  const workflow = acquireWorkflow(task.ownerSessionId);
+  const workflow = acquireWorkflow(task.ownerKey);
   workflow.loginTaskId = task.id;
   workflow.miniappTaskId = "";
   workflow.phase = "login";
@@ -600,7 +671,8 @@ async function refreshLogin(task) {
     task.qrImage = readNapcatQrImage() || task.qrImage;
     task.status = "pending";
     task.error = undefined;
-    task.expiresAt = Date.now() + 5 * 60 * 1000;
+    task.expiresAt = Date.now() + config.taskTtlMs;
+    scheduleTaskExpiry(task);
     return task;
   }
   if (task.mode !== "webui-api") {
@@ -617,11 +689,12 @@ async function refreshLogin(task) {
   task.qrImage = qrImage;
   task.status = "pending";
   task.error = undefined;
-  task.expiresAt = Date.now() + 5 * 60 * 1000;
+  task.expiresAt = Date.now() + config.taskTtlMs;
+  scheduleTaskExpiry(task);
   task.scanned = false;
   task.confirmed = false;
   task.cancelled = false;
-  if (activeWorkflow?.ownerSessionId === task.ownerSessionId) {
+  if (activeWorkflow?.ownerKey === task.ownerKey) {
     activeWorkflow.phase = "login";
     activeWorkflow.expiresAt = Date.now() + config.workflowTtlMs;
   }
@@ -632,25 +705,41 @@ function validAppId(appId) {
   return typeof appId === "string" && /^[A-Za-z0-9_-]{3,128}$/.test(appId);
 }
 
-async function miniappStart(appId, ownerSessionId) {
+async function miniappStart(appId, loginTaskId) {
   if (!validAppId(appId)) {
     const error = new Error("appId must be 3-128 ASCII letters, numbers, '_' or '-'");
     error.status = 400;
     throw error;
   }
-  const workflow = requireWorkflowOwner(ownerSessionId);
-  const loginTask = workflow.loginTaskId ? tasks.get(workflow.loginTaskId) : undefined;
-  if (!loginTask) {
-    const error = new Error("请先完成 QQ 扫码登录");
+  const loginTask = tasks.get(loginTaskId);
+  if (!loginTaskId) {
+    const error = new Error("请提供二维码登录任务 taskId");
     error.status = 409;
-    error.code = "LOGIN_REQUIRED";
+    error.code = "WORKFLOW_REQUIRED";
+    error.task = expiredTaskPayload(loginTaskId, "qq-login");
     throw error;
   }
+  if (!loginTask || loginTask.kind !== "napcat-login") {
+    const error = new Error("请先创建 QQ 扫码登录任务");
+    error.status = 409;
+    error.code = "TASK_EXPIRED";
+    error.task = expiredTaskPayload(loginTaskId, "qq-login");
+    throw error;
+  }
+  if (loginTask.status === "expired") {
+    const error = new Error("Login task expired");
+    error.status = 409;
+    error.code = "TASK_EXPIRED";
+    error.task = publicTask(loginTask);
+    throw error;
+  }
+  const workflow = requireWorkflowOwner(loginTask.ownerKey);
   await loginStatus(loginTask);
   if (loginTask.status !== "success") {
     const error = new Error("请先完成 QQ 扫码登录，再获取小程序 code");
     error.status = 409;
     error.code = "LOGIN_REQUIRED";
+    error.task = publicTask(loginTask);
     throw error;
   }
   if (workflow.miniappTaskId) {
@@ -660,7 +749,7 @@ async function miniappStart(appId, ownerSessionId) {
     }
   }
   if (workflow.miniappStartPromise) return workflow.miniappStartPromise;
-  const operation = startMiniappThroughBridge(appId, ownerSessionId, workflow);
+  const operation = startMiniappThroughBridge(appId, loginTask.ownerKey, workflow);
   workflow.miniappStartPromise = operation;
   try {
     return await operation;
@@ -669,7 +758,7 @@ async function miniappStart(appId, ownerSessionId) {
   }
 }
 
-async function startMiniappThroughBridge(appId, ownerSessionId, workflow) {
+async function startMiniappThroughBridge(appId, ownerKey, workflow) {
   workflow.phase = "miniapp";
   workflow.expiresAt = Date.now() + config.workflowTtlMs;
   if (config.bridgeUrl) {
@@ -680,6 +769,7 @@ async function startMiniappThroughBridge(appId, ownerSessionId, workflow) {
     const task = createTask("miniapp-login", {
       mode: "bridge",
       appId,
+      loginTaskId: workflow.loginTaskId,
       upstreamTaskId: result.taskId || result.task_id || result.id,
       status: result.code ? "success" : mapStatus(result),
       code: result.code,
@@ -687,7 +777,7 @@ async function startMiniappThroughBridge(appId, ownerSessionId, workflow) {
       qrImage: result.qrImage || result.qr_image,
       user: result.user,
       error: result.error || result.message
-    }, ownerSessionId);
+    }, ownerKey);
     workflow.miniappTaskId = task.id;
     workflow.expiresAt = Math.max(workflow.expiresAt, task.expiresAt);
     if (task.status === "success" && !task.code) {
@@ -695,7 +785,7 @@ async function startMiniappThroughBridge(appId, ownerSessionId, workflow) {
       task.error = "Bridge reported success without an authorization code";
     }
     if (task.status === "success") await finalizeMiniappTask(task);
-    else if (["failed", "expired", "login_required"].includes(task.status)) releaseWorkflow(ownerSessionId);
+    else if (["failed", "expired", "login_required"].includes(task.status)) releaseWorkflow(ownerKey);
     return task;
   }
   const error = new Error("No mini-app bridge configured. Start bridge.js or set BRIDGE_URL.");
@@ -713,7 +803,143 @@ async function requestNapcatLogout(taskId) {
     error.payload = result;
     throw error;
   }
+  // NapCat 4.18.x can tear down the native wrapper session while leaving its
+  // WebUI QQLoginStatus flag set in memory. Ask NapCat to restart its worker
+  // so the next QR request is accepted as a fresh login.
+  if (isWebUiConfigured()) {
+    try {
+      await webUiCall("/QQLogin/RestartNapCat");
+      await new Promise((resolve) => setTimeout(resolve, 1_000));
+      let lastStatus;
+      for (let attempt = 0; attempt < 24; attempt += 1) {
+        try {
+          lastStatus = await webUiCall("/QQLogin/CheckLoginStatus");
+          if (lastStatus?.isLogin !== true) break;
+        } catch {
+          // The worker can be briefly unavailable while it is restarting.
+        }
+        await new Promise((resolve) => setTimeout(resolve, 250));
+      }
+      if (!lastStatus || typeof lastStatus.isLogin !== "boolean") {
+        const error = new Error("NapCat worker restart status could not be verified");
+        error.payload = { logout: result };
+        throw error;
+      }
+      if (lastStatus.isLogin === true) {
+        const error = new Error("NapCat worker restart did not clear the login state");
+        error.payload = { logout: result, status: lastStatus };
+        throw error;
+      }
+      return { ...result, workerRestarted: true };
+    } catch (error) {
+      if (!error.payload) error.payload = { logout: result };
+      throw error;
+    }
+  }
   return result;
+}
+
+async function requestNapcatLoginCancel() {
+  if (!isWebUiConfigured()) return;
+  try {
+    await webUiCall("/QQLogin/CancelLogin");
+  } catch {
+    // Some NapCat versions do not expose a cancel endpoint. Releasing the
+    // local task is still sufficient; the next QR request refreshes it.
+  }
+}
+
+async function cancelTask(task, reason = "任务已取消", { expired = false } = {}) {
+  if (!task) return task;
+  if (task.status === "success" && task.logoutStatus === "success" && task.released) {
+    if (expired) {
+      task.status = "expired";
+      task.cancelled = true;
+    }
+    removeTaskAndLinks(task);
+    return task;
+  }
+  if (task.kind === "napcat-login") {
+    const linkedMiniTask = [...tasks.values()].find((candidate) =>
+      candidate.kind === "miniapp-login" && candidate.loginTaskId === task.id && ["pending", "scanned"].includes(candidate.status)
+    );
+    if (linkedMiniTask) {
+      if (linkedMiniTask.mode === "bridge" && linkedMiniTask.upstreamTaskId) {
+        try {
+          await bridgeCall(`${config.bridgeMiniCancelPath}/${encodeURIComponent(linkedMiniTask.upstreamTaskId)}`, { method: "POST" });
+        } catch {
+          // The linked bridge task may already be terminal.
+        }
+      }
+      linkedMiniTask.status = expired ? "expired" : "cancelled";
+      linkedMiniTask.cancelled = true;
+      linkedMiniTask.error = reason;
+      linkedMiniTask.released = true;
+      linkedMiniTask.logoutStatus = "delegated";
+      removeTaskFromCache(linkedMiniTask);
+    }
+  }
+  const needsLogout = task.kind === "miniapp-login" || task.status === "success";
+  if (task.kind === "miniapp-login" && task.mode === "bridge" && task.upstreamTaskId) {
+    try {
+      await bridgeCall(`${config.bridgeMiniCancelPath}/${encodeURIComponent(task.upstreamTaskId)}`, { method: "POST" });
+    } catch {
+      // The bridge task may already have completed; logout below remains the
+      // authoritative release operation.
+    }
+  } else if (task.kind === "napcat-login" && !needsLogout) {
+    await requestNapcatLoginCancel();
+  }
+  task.status = expired ? "expired" : "cancelled";
+  task.cancelled = true;
+  task.error = reason;
+  if (task.expirationTimer) {
+    clearTimeout(task.expirationTimer);
+    task.expirationTimer = undefined;
+  }
+  if (!needsLogout) {
+    task.released = true;
+    task.logoutStatus = task.logoutStatus || "not_required";
+    releaseWorkflow(task.ownerKey);
+    removeTaskAndLinks(task);
+    return task;
+  }
+  if (task.logoutPromise) return task.logoutPromise;
+  task.logoutStatus = "pending";
+  task.logoutPromise = (async () => {
+    try {
+      const result = await requestNapcatLogout(task.id);
+      task.logoutStatus = "success";
+      task.logoutMethod = result.method || "NodeIKernelLoginService.offline";
+      task.released = true;
+      logoutRecoveryRequired = false;
+      const loginTask = task.loginTaskId && tasks.get(task.loginTaskId);
+      if (loginTask) {
+        loginTask.logoutStatus = "success";
+        loginTask.logoutMethod = task.logoutMethod;
+        loginTask.released = true;
+      }
+      releaseWorkflow(task.ownerKey);
+    } catch (error) {
+      task.logoutStatus = "failed";
+      task.logoutError = error.message;
+      task.released = false;
+      logoutRecoveryRequired = true;
+    } finally {
+      task.logoutPromise = null;
+      if (task.logoutStatus === "success" || expired) removeTaskAndLinks(task);
+    }
+    return task;
+  })();
+  return task.logoutPromise;
+}
+
+async function expireTaskIfNeeded(task) {
+  if (!task || task.expiresAt > Date.now()) return task;
+  if (task.status === "pending" || task.status === "scanned" || task.status === "success") {
+    return cancelTask(task, "任务已超过 2 分钟，已自动取消并释放", { expired: true });
+  }
+  return task;
 }
 
 async function ensureLogoutRecovery() {
@@ -721,8 +947,17 @@ async function ensureLogoutRecovery() {
   if (!logoutRecoveryPromise) {
     logoutRecoveryPromise = (async () => {
       try {
-        await requestNapcatLogout("recovery");
+        const result = await requestNapcatLogout("recovery");
         logoutRecoveryRequired = false;
+        for (const task of tasks.values()) {
+          if (task.logoutStatus === "failed") {
+            task.logoutStatus = "success";
+            task.logoutMethod = result.method || "NodeIKernelLoginService.offline";
+            task.logoutError = undefined;
+            task.released = true;
+          }
+        }
+        releaseWorkflow();
       } catch (error) {
         const wrapped = new Error(`上一次 QQ 自动注销失败，无法开始下一位用户：${error.message}`);
         wrapped.status = 503;
@@ -749,13 +984,19 @@ async function finalizeMiniappTask(task) {
       task.logoutMethod = result.method || "NodeIKernelLoginService.offline";
       task.released = true;
       logoutRecoveryRequired = false;
+      const loginTask = task.kind === "napcat-login" ? task : task.loginTaskId && tasks.get(task.loginTaskId);
+      if (loginTask) {
+        loginTask.logoutStatus = "success";
+        loginTask.logoutMethod = task.logoutMethod;
+        loginTask.released = true;
+      }
     } catch (error) {
       task.logoutStatus = "failed";
       task.logoutError = error.message;
-      task.released = true;
+      task.released = false;
       logoutRecoveryRequired = true;
     } finally {
-      releaseWorkflow(task.ownerSessionId);
+      if (task.logoutStatus === "success") releaseWorkflow(task.ownerKey);
       task.logoutPromise = null;
     }
     return task;
@@ -764,7 +1005,7 @@ async function finalizeMiniappTask(task) {
 }
 
 async function miniappStatus(task) {
-  if (task.status === "pending" && task.expiresAt < Date.now()) task.status = "expired";
+  await expireTaskIfNeeded(task);
   if (task.status === "pending" && task.mode === "bridge") {
     try {
       const result = await bridgeCall(`${config.bridgeMiniStatusPath}/${encodeURIComponent(task.upstreamTaskId || task.id)}`);
@@ -783,7 +1024,11 @@ async function miniappStatus(task) {
     task.error = "Bridge reported success without an authorization code";
   }
   if (task.status === "success") await finalizeMiniappTask(task);
-  else if (["failed", "expired", "login_required"].includes(task.status)) releaseWorkflow(task.ownerSessionId);
+  else if (["expired", "cancelled"].includes(task.status) && !task.logoutStatus) {
+    await cancelTask(task, task.error || "小程序授权任务已取消", { expired: task.status === "expired" });
+  } else if (["failed", "expired", "cancelled", "login_required"].includes(task.status) && !["pending", "failed"].includes(task.logoutStatus)) {
+    releaseWorkflow(task.ownerKey);
+  }
   return task;
 }
 
@@ -850,50 +1095,79 @@ function sendJson(response, status, payload) {
   response.end(body);
 }
 
-function taskForRequest(taskId, kind, session, strictOwnership) {
+function taskForRequest(taskId, kind) {
   const task = tasks.get(taskId);
-  if (!task || task.kind !== kind) {
-    const error = new Error(kind === "napcat-login" ? "Login task not found" : "Mini-app task not found");
+  if (!task || (kind && task.kind !== kind)) {
+    const error = new Error("Task not found or expired");
     error.status = 404;
-    throw error;
-  }
-  if ((strictOwnership || session?.fromCookie) && (!session || !task.ownerSessionId || task.ownerSessionId !== session.id)) {
-    const error = new Error("Task does not belong to this browser session");
-    error.status = 404;
+    error.code = "TASK_EXPIRED";
+    error.task = expiredTaskPayload(taskId, kind === "napcat-login" ? "qq-login" : kind === "miniapp-login" ? "miniapp-code" : undefined);
     throw error;
   }
   return task;
 }
 
-function apiTaskPayload(task) {
-  const value = publicTask(task);
+function miniTaskForRequest(taskId) {
+  const task = tasks.get(taskId);
+  if (task?.kind === "miniapp-login") return task;
+  if (task?.kind === "napcat-login") {
+    const linked = [...tasks.values()].find((candidate) => candidate.kind === "miniapp-login" && candidate.loginTaskId === taskId);
+    if (linked) return linked;
+  }
+  const error = new Error("Mini-app task not found");
+  error.status = 404;
+  throw error;
+}
+
+function apiTaskPayload(task, ok = taskResponseOk(task)) {
+  const payload = { ok, task: publicTask(task) };
+  if (!ok && task?.status === "expired") {
+    payload.code = "TASK_EXPIRED";
+    payload.error = task.error || "Task expired";
+  }
+  return payload;
+}
+
+function miniappOperationPayload(task) {
+  if (!task) return { ok: false, code: "TASK_EXPIRED", status: "expired" };
+  if (task.status === "success" && task.code && task.logoutStatus === "success") {
+    return { ok: true, code: task.code };
+  }
+  if (task.status === "success" && task.logoutStatus === "failed") {
+    return { ok: false, code: "LOGOUT_FAILED", status: "failed", error: task.logoutError || "QQ logout failed" };
+  }
+  if (task.status === "expired") {
+    return { ok: false, code: "TASK_EXPIRED", status: "expired", error: task.error || "Task expired" };
+  }
   return {
-    ok: true,
-    taskId: task.id,
-    status: value.status,
-    state: value.state,
-    scanned: Boolean(value.scanned),
-    confirmed: Boolean(value.confirmed),
-    cancelled: Boolean(value.cancelled),
-    isScanned: Boolean(value.scanned),
-    isConfirmed: Boolean(value.confirmed),
-    isCancelled: Boolean(value.cancelled),
-    isLogin: value.status === "success",
-    qrImage: value.qrImage,
-    qrUrl: value.qrUrl,
-    qrcode: value.qrUrl || value.qrImage,
-    code: value.code,
-    logoutStatus: value.logoutStatus,
-    logoutMethod: value.logoutMethod,
-    logoutError: value.logoutError,
-    released: Boolean(value.released),
-    error: value.error,
-    expiresAt: value.expiresAt,
-    task: value
+    ok: false,
+    status: task.status,
+    code: task.status === "login_required" ? "LOGIN_REQUIRED" : "MINIAPP_FAILED",
+    error: task.error || "Mini-app authorization failed"
   };
 }
 
-async function waitForMiniappTask(task, timeoutMs = 50_000) {
+function logoutOperationPayload(task) {
+  if (!task || task.status === "expired") {
+    return { ok: false, code: "TASK_EXPIRED", status: "expired", error: task?.error || "Task not found or expired" };
+  }
+  if (task.logoutStatus === "failed") {
+    return { ok: false, code: "LOGOUT_FAILED", status: task.status, error: task.logoutError || "QQ logout failed" };
+  }
+  return { ok: true };
+}
+
+function operationErrorPayload(error) {
+  if (error?.code === "TASK_EXPIRED" || error?.task?.status === "expired") {
+    return { ok: false, code: "TASK_EXPIRED", status: "expired", error: error.message || "Task not found or expired" };
+  }
+  const payload = { ok: false, error: error?.message || "Request failed" };
+  if (error?.code) payload.code = error.code;
+  if (error?.task?.status) payload.status = error.task.status;
+  return payload;
+}
+
+async function waitForMiniappTask(task, timeoutMs = config.taskTtlMs) {
   const deadline = Date.now() + timeoutMs;
   while (task.status === "pending" && Date.now() < deadline) {
     await miniappStatus(task);
@@ -901,48 +1175,35 @@ async function waitForMiniappTask(task, timeoutMs = 50_000) {
     await new Promise((resolve) => setTimeout(resolve, 250));
   }
   if (task.status === "pending") {
-    task.status = "expired";
+    await cancelTask(task, "授权任务等待超时，已自动取消", { expired: true });
     task.error = "授权任务等待超时，请重新请求";
   }
   return task;
 }
 
-async function serveStatic(response, requestPath) {
-  const relative = requestPath === "/" ? "index.html" : requestPath.replace(/^\/+/, "");
-  const resolved = path.resolve(publicDir, relative);
-  if (!resolved.startsWith(`${publicDir}${path.sep}`)) return false;
-  try {
-    const content = await fs.readFile(resolved);
-    const type = path.extname(resolved) === ".html" ? "text/html; charset=utf-8" :
-      path.extname(resolved) === ".css" ? "text/css; charset=utf-8" :
-      path.extname(resolved) === ".js" ? "text/javascript; charset=utf-8" : "application/octet-stream";
-    response.writeHead(200, { "Content-Type": type, "Cache-Control": "no-cache" });
-    response.end(content);
-    return true;
-  } catch {
-    return false;
-  }
-}
-
 async function route(request, response) {
   const url = new URL(request.url, `http://${request.headers.host || "localhost"}`);
   const method = request.method || "GET";
-  const session = url.pathname.startsWith("/api/") && url.pathname !== "/api/health"
-    ? ensureVisitorSession(request, response)
-    : undefined;
   try {
     if (method === "OPTIONS") {
       const headers = {
-        "Access-Control-Allow-Headers": "Content-Type, Authorization",
+        "Access-Control-Allow-Headers": "Content-Type, Authorization, X-API-Signature",
         "Access-Control-Allow-Methods": "GET,POST,OPTIONS"
       };
       if (config.corsOrigin && config.corsOrigin !== "same-origin") {
         headers["Access-Control-Allow-Origin"] = config.corsOrigin;
         headers["Access-Control-Allow-Credentials"] = "true";
       }
-      response.writeHead(204, headers);
+      response.writeHead(200, headers);
       response.end();
       return;
+    }
+    if (requiresApiSignature(url.pathname)) {
+      const auth = verifyApiSignature(request);
+      if (!auth.ok) {
+        sendJson(response, 200, auth);
+        return;
+      }
     }
     if (url.pathname === "/api/health" && method === "GET") {
       sendJson(response, 200, {
@@ -958,97 +1219,48 @@ async function route(request, response) {
       });
       return;
     }
-    if (url.pathname === "/api/user" && method === "GET") {
-      if (logoutRecoveryRequired) {
-        const error = new Error("上一位用户的 QQ 尚未完成注销，请稍后再试");
-        error.status = 503;
-        error.code = "LOGOUT_REQUIRED";
-        throw error;
-      }
-      const workflow = expireWorkflowIfNeeded();
-      if (workflow && workflow.ownerSessionId !== session.id) throw makeWorkflowBusyError(workflow);
-      const user = await currentUser();
-      sendJson(response, 200, { ok: true, user });
+    if (url.pathname === "/api/qq/login/qrcode" && method === "POST") {
+      sendJson(response, 200, apiTaskPayload(await loginStart()));
       return;
     }
-    if (url.pathname === "/api/qq/login/qrcode" && ["GET", "POST"].includes(method)) {
-      sendJson(response, 200, apiTaskPayload(await loginStart(session.id)));
-      return;
-    }
-    if (url.pathname === "/api/qq/login/status" && ["GET", "POST"].includes(method)) {
-      const body = method === "POST" ? await parseBody(request) : {};
-      const taskId = url.searchParams.get("taskId") || body.taskId;
-      const task = taskForRequest(taskId, "napcat-login", session, true);
-      sendJson(response, 200, apiTaskPayload(await loginStatus(task)));
-      return;
-    }
-    const canonicalLoginMatch = url.pathname.match(/^\/api\/qq\/login\/status\/([^/]+)$/);
-    if (canonicalLoginMatch && ["GET", "POST"].includes(method)) {
-      const task = taskForRequest(canonicalLoginMatch[1], "napcat-login", session, true);
-      sendJson(response, 200, apiTaskPayload(await loginStatus(task)));
-      return;
-    }
-    const canonicalLoginRefreshMatch = url.pathname.match(/^\/api\/qq\/login\/refresh\/([^/]+)$/);
-    if (canonicalLoginRefreshMatch && method === "POST") {
-      const task = taskForRequest(canonicalLoginRefreshMatch[1], "napcat-login", session, true);
-      sendJson(response, 200, apiTaskPayload(await refreshLogin(task)));
+    if (["/api/qq/login/status", "/api/qq/login/status/"].includes(url.pathname) && method === "POST") {
+      const body = await parseBody(request);
+      const task = taskForRequest(body.taskId, "napcat-login");
+      const refresh = body.refresh === true || body.refresh === "true";
+      const result = refresh ? await refreshLogin(task) : await loginStatus(task);
+      sendJson(response, 200, apiTaskPayload(result));
       return;
     }
     if (url.pathname === "/api/qq/miniapp/code" && method === "POST") {
       const body = await parseBody(request);
-      const task = await miniappStart(body.appId, session.id);
-      if (body.wait === true || body.wait === "true") await waitForMiniappTask(task);
-      sendJson(response, task.status === "failed" || task.status === "login_required" ? 502 : 200, apiTaskPayload(task));
+      const taskId = body.taskId || body.loginTaskId;
+      const existing = tasks.get(taskId);
+      const task = existing?.kind === "miniapp-login" ? await miniappStatus(existing) : await miniappStart(body.appId, taskId);
+      await waitForMiniappTask(task);
+      const payload = miniappOperationPayload(task);
+      if (["success", "expired", "failed", "cancelled", "login_required"].includes(task.status)) removeTaskAndLinks(task);
+      sendJson(response, 200, payload);
       return;
     }
-    const canonicalMiniStatusMatch = url.pathname.match(/^\/api\/qq\/miniapp\/(?:code\/)?status\/([^/]+)$/);
-    if (canonicalMiniStatusMatch && ["GET", "POST"].includes(method)) {
-      const task = taskForRequest(canonicalMiniStatusMatch[1], "miniapp-login", session, true);
-      sendJson(response, 200, apiTaskPayload(await miniappStatus(task)));
-      return;
-    }
-    const canonicalMiniCodeMatch = url.pathname.match(/^\/api\/qq\/miniapp\/code\/([^/]+)$/);
-    if (canonicalMiniCodeMatch && ["GET", "POST"].includes(method)) {
-      const task = taskForRequest(canonicalMiniCodeMatch[1], "miniapp-login", session, true);
-      sendJson(response, 200, apiTaskPayload(await miniappStatus(task)));
-      return;
-    }
-    if (url.pathname === "/api/login/start" && method === "POST") {
-      sendJson(response, 200, { ok: true, task: publicTask(await loginStart(session.id)) });
-      return;
-    }
-    const loginMatch = url.pathname.match(/^\/api\/login\/status\/([^/]+)$/);
-    if (loginMatch && method === "GET") {
-      const task = taskForRequest(loginMatch[1], "napcat-login", session, true);
-      sendJson(response, 200, { ok: true, task: publicTask(await loginStatus(task)) });
-      return;
-    }
-    const loginRefreshMatch = url.pathname.match(/^\/api\/login\/refresh\/([^/]+)$/);
-    if (loginRefreshMatch && method === "POST") {
-      const task = taskForRequest(loginRefreshMatch[1], "napcat-login", session, true);
-      sendJson(response, 200, { ok: true, task: publicTask(await refreshLogin(task)) });
-      return;
-    }
-    if (url.pathname === "/api/miniapp/start" && method === "POST") {
+    if (url.pathname === "/api/qq/logout" && method === "POST") {
       const body = await parseBody(request);
-      sendJson(response, 200, { ok: true, task: publicTask(await miniappStart(body.appId, session.id)) });
+      const taskId = body.taskId || body.loginTaskId;
+      const task = taskForRequest(taskId);
+      if (task.status === "expired") removeTaskFromCache(task);
+      else await cancelTask(task, "QQ 已注销，任务已释放");
+      sendJson(response, 200, logoutOperationPayload(task));
       return;
     }
-    const miniMatch = url.pathname.match(/^\/api\/miniapp\/status\/([^/]+)$/);
-    if (miniMatch && method === "GET") {
-      const task = taskForRequest(miniMatch[1], "miniapp-login", session, true);
-      sendJson(response, 200, { ok: true, task: publicTask(await miniappStatus(task)) });
-      return;
-    }
-    if (url.pathname === "/api/miniapp/exchange" && method === "POST") {
-      sendJson(response, 200, { ok: true, result: await exchangeMiniappCode(await parseBody(request)) });
-      return;
-    }
-    if (method === "GET" && await serveStatic(response, url.pathname)) return;
-    sendJson(response, 404, { ok: false, error: "Not found" });
+    sendJson(response, url.pathname.startsWith("/api/") ? 200 : 404, { ok: false, error: "Not found" });
   } catch (error) {
-    const status = Number.isInteger(error.status) ? error.status : 502;
-    sendJson(response, status, { ok: false, code: error.code, error: error.message, details: error.payload });
+    if (url.pathname === "/api/qq/miniapp/code" || url.pathname === "/api/qq/logout") {
+      sendJson(response, 200, operationErrorPayload(error));
+      return;
+    }
+    const payload = { ok: false, error: error.message || "Request failed" };
+    if (error.code) payload.code = error.code;
+    if (error.task) payload.task = error.task;
+    sendJson(response, url.pathname.startsWith("/api/") ? 200 : (Number.isInteger(error.status) ? error.status : 502), payload);
   }
 }
 
@@ -1059,14 +1271,18 @@ export function createServer() {
 }
 
 const cleanupTimer = setInterval(() => {
+  for (const task of tasks.values()) {
+    if (task.expiresAt <= Date.now() && ["pending", "scanned", "success"].includes(task.status)) {
+      void expireTaskIfNeeded(task);
+    }
+  }
   expireWorkflowIfNeeded();
   const cutoff = Date.now() - 10 * 60 * 1000;
   for (const [id, task] of tasks) {
-    if (task.expiresAt < cutoff || task.createdAt < cutoff) tasks.delete(id);
-  }
-  const sessionCutoff = Date.now() - config.sessionTtlMs;
-  for (const [id, session] of visitorSessions) {
-    if (session.lastSeenAt < sessionCutoff) visitorSessions.delete(id);
+    if (task.expiresAt < cutoff || task.createdAt < cutoff) {
+      if (task.expirationTimer) clearTimeout(task.expirationTimer);
+      tasks.delete(id);
+    }
   }
 }, 60_000);
 cleanupTimer.unref();

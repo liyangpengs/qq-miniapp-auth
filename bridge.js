@@ -15,7 +15,7 @@ const config = {
   napcatPluginUrl: trimSlash(process.env.NAPCAT_OPEN_AUTH_PLUGIN_URL || "http://127.0.0.1:6099/plugin/qq-miniapp-openauth/api"),
   napcatPluginToken: process.env.NAPCAT_OPEN_AUTH_PLUGIN_TOKEN || "",
   napcatTimeoutMs: numberEnv("NAPCAT_OPEN_AUTH_TIMEOUT_MS", 45_000),
-  ttlMs: numberEnv("BRIDGE_TASK_TTL_MS", 5 * 60 * 1000)
+  ttlMs: numberEnv("BRIDGE_TASK_TTL_MS", 2 * 60 * 1000)
 };
 
 const sessions = new Map();
@@ -32,6 +32,17 @@ function validAppId(appId) {
 }
 
 function makeId() { return crypto.randomBytes(18).toString("hex"); }
+
+function scheduleSessionExpiry(session) {
+  const delay = Math.max(1, session.expiresAt - Date.now() + 5);
+  session.expirationTimer = setTimeout(() => {
+    if (session.status === "pending") {
+      session.status = "expired";
+      session.error = "授权任务已超过 2 分钟，已自动取消";
+    }
+  }, delay);
+  session.expirationTimer.unref?.();
+}
 
 function sendJson(response, status, payload) {
   const body = JSON.stringify(payload);
@@ -114,13 +125,15 @@ function extractOpenAuthCode(payload) {
   // method-specific `result` field.
   if (typeof payload?.code === "string") {
     code = payload.code.trim();
+  } else if (typeof payload?.authorizationCode === "string") {
+    code = payload.authorizationCode.trim();
   } else if (typeof payload?.authorization?.code === "string") {
     code = payload.authorization.code.trim();
   } else if (typeof inner === "string") {
     code = inner.trim();
   } else if (inner && typeof inner === "object") {
     code = String(
-      inner.code || inner.openCode || inner.authCode || inner.auth_code ||
+      inner.code || inner.authorizationCode || inner.authorization_code || inner.openCode || inner.authCode || inner.auth_code ||
       inner.accessToken || inner.token || inner.openAuthCode || ""
     ).trim();
   }
@@ -227,9 +240,11 @@ function createMiniappSession(appId) {
     uin: undefined,
     nickname: undefined,
     action: undefined,
+    cancelled: false,
     error: undefined
   };
   sessions.set(session.id, session);
+  scheduleSessionExpiry(session);
   // OpenAuth can take several seconds. Keep the HTTP start request fast and
   // let the status endpoint observe the result.
   void authorizeMiniappSession(session);
@@ -252,6 +267,7 @@ async function authorizeMiniappSession(session) {
       throw error;
     }
     const authorization = await invokeOpenAuth(session.appId);
+    if (session.status !== "pending") return session;
     if (Date.now() >= session.expiresAt) {
       session.status = "expired";
       session.error = "授权任务已过期";
@@ -263,6 +279,7 @@ async function authorizeMiniappSession(session) {
     session.nickname = profile.nickname || undefined;
     session.action = authorization.action;
     session.status = "success";
+    if (session.expirationTimer) clearTimeout(session.expirationTimer);
     return session;
   } catch (error) {
     if (Date.now() >= session.expiresAt) {
@@ -286,6 +303,7 @@ function publicSession(session) {
     uin: session.uin,
     nickname: session.nickname,
     error: session.error,
+    cancelled: Boolean(session.cancelled),
     expiresAt: session.expiresAt
   };
 }
@@ -337,6 +355,19 @@ async function route(request, response) {
       sendJson(response, 200, result);
       return;
     }
+    const cancelMatch = url.pathname.match(/^\/api\/miniapp\/login\/cancel\/([^/]+)$/);
+    if (cancelMatch && request.method === "POST") {
+      const session = sessions.get(cancelMatch[1]);
+      if (!session) return sendJson(response, 404, { ok: false, error: "Mini-app login task not found" });
+      if (["pending", "login_required"].includes(session.status)) {
+        session.status = "cancelled";
+        session.cancelled = true;
+        session.error = "任务已取消";
+        if (session.expirationTimer) clearTimeout(session.expirationTimer);
+      }
+      sendJson(response, 200, { ok: true, ...publicSession(session), cancelled: true });
+      return;
+    }
     const match = url.pathname.match(/^\/api\/miniapp\/login\/status\/([^/]+)$/);
     if (match && request.method === "GET") {
       const session = sessions.get(match[1]);
@@ -365,7 +396,12 @@ export function listenBridgeServer(server, callback) {
 
 const cleanupTimer = setInterval(() => {
   const cutoff = Date.now() - config.ttlMs - 60_000;
-  for (const [id, session] of sessions) if (session.createdAt < cutoff) sessions.delete(id);
+  for (const [id, session] of sessions) {
+    if (session.createdAt < cutoff) {
+      if (session.expirationTimer) clearTimeout(session.expirationTimer);
+      sessions.delete(id);
+    }
+  }
 }, 60_000);
 cleanupTimer.unref();
 

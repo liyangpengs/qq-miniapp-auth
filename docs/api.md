@@ -1,105 +1,146 @@
-# HTTP API
+# HTTP API 接口文档
 
-Web 服务默认地址为 `http://127.0.0.1:8787`。浏览器请求会收到 HttpOnly 的 `qqma_session` cookie；后续轮询必须携带同一个 cookie，其他浏览器不能读取该任务。
+公开 Web API 只有四个业务接口，所有接口都返回 HTTP `200`，调用方通过 `ok` 字段
+判断成功或失败。二维码状态接口返回任务对象；小程序 code 和注销接口只返回操作结果，
+不会返回任务详情。
 
-## 获取 QQ 登录二维码
+四个业务接口都要求在 `X-API-Signature` 请求头中传入 `API_SIGNING_SECRET` 配置的固定值。
+默认值为 `qq-miniapp-auth-default-signing-secret`，生产环境应修改。诊断接口
+`GET /api/health` 不要求签名。签名只进行字符串直接比较，不使用 HMAC、哈希、时间戳、
+随机数或其他加密/签名算法。
+
+服务默认地址为 `http://127.0.0.1:8787`。二维码接口返回的 `task.id` 是调用方后续请求
+使用的任务标识，不创建也不要求 cookie。
+
+## 1. 获取登录二维码
 
 ```http
 POST /api/qq/login/qrcode
+X-API-Signature: qq-miniapp-auth-default-signing-secret
 ```
 
-也支持 `GET`。成功返回 `200`，示例字段：
+示例响应：
 
 ```json
 {
   "ok": true,
-  "taskId": "任务ID",
-  "status": "pending",
-  "state": "waiting_scan",
-  "qrImage": "data:image/png;base64,...",
-  "expiresAt": 0,
-  "task": { "id": "任务ID", "kind": "napcat-login" }
+  "task": {
+    "id": "login-task-id",
+    "type": "qq-login",
+    "status": "waiting_scan",
+    "qrImage": "data:image/png;base64,...",
+    "expiresAt": 1700000000000
+  }
 }
 ```
 
-二维码来自 NapCat WebUI 的 `QQLogin/GetQQLoginQrcode`，服务只负责转换成浏览器可显示的图片，不生成假二维码，也不会跳转到 NapCat WebUI。
-
-同一浏览器重复请求会复用任务；其他浏览器在当前工作流结束前收到 `409 WORKFLOW_BUSY`。
-
-## 轮询扫码状态
+## 2. 查询扫码状态并刷新二维码
 
 ```http
-GET /api/qq/login/status/{taskId}
+POST /api/qq/login/status
+Content-Type: application/json
+X-API-Signature: qq-miniapp-auth-default-signing-secret
+
+{"taskId":"login-task-id"}
 ```
 
-也支持 `POST /api/qq/login/status/{taskId}` 和 `POST /api/qq/login/refresh/{taskId}`（刷新二维码）。`state` 的含义：
+每次请求都会向 NapCat 查询最新状态和二维码。如果 NapCat 返回了新的二维码，响应中的
+`task.qrUrl` 或 `task.qrImage` 会同步更新。
 
-| state | 含义 |
+如需强制让 NapCat 生成新的二维码，请传入 `refresh: true`：
+
+```http
+POST /api/qq/login/status/
+Content-Type: application/json
+X-API-Signature: qq-miniapp-auth-default-signing-secret
+
+{"taskId":"login-task-id","refresh":true}
+```
+
+刷新后任务状态会重置为 `waiting_scan`，二维码会被替换，任务有效期也会重新计算。
+带结尾斜杠的地址只是兼容写法，参数仍然必须放在 JSON 请求体中。
+
+`task.status` 可能是以下值：
+
+| 状态 | 含义 |
 | --- | --- |
 | `waiting_scan` | 等待用户扫码 |
-| `scanned` | 已扫码，等待手机确认 |
-| `confirmed` | 已确认登录，QQ 已登录 |
-| `cancelled` | 用户取消或拒绝 |
-| `expired` | 二维码或任务过期 |
+| `scanned` | 已扫码，等待用户确认 |
+| `confirmed` | QQ 登录已确认 |
+| `cancelled` | 任务已取消 |
+| `expired` | 任务已超过有效期 |
 | `failed` | NapCat 返回错误 |
 
-成功时响应还包含 `user`。只有 `state=confirmed` 后才能获取小程序 code。
+任务对象还可能包含 `scanned`、`confirmed` 和 `cancelled` 标记。公开状态响应不包含用户
+资料，只有 `confirmed` 状态才能请求小程序授权 code。
 
-## 获取当前用户信息
-
-```http
-GET /api/user
-```
-
-返回 NapCat OneBot `get_login_info` 的用户数据；OneBot 不可用时会尝试 NapCat WebUI 的 `QQLogin/GetQQLoginInfo`。如果其他浏览器占用工作流，返回 `409 WORKFLOW_BUSY`。
-
-## 通过 appId 获取小程序授权 code
+## 3. 获取小程序授权 code 并注销登录
 
 ```http
 POST /api/qq/miniapp/code
 Content-Type: application/json
+X-API-Signature: qq-miniapp-auth-default-signing-secret
 
-{"appId":"1112386029"}
+{"taskId":"login-task-id","appId":"1112386029"}
 ```
 
-`appId` 允许 3-128 个 ASCII 字母、数字、下划线或短横线。请求必须来自已经完成扫码登录的同一浏览器 session。接口先快速创建任务，然后轮询：
-
-```http
-GET /api/qq/miniapp/status/{taskId}
-```
-
-成功响应包含真实 code，并自动注销 QQ：
+接口默认会等待 OpenAuth 授权完成，然后注销 QQ，并确认 NapCat worker 已经退出登录，
+最终只返回操作结果和真实授权码：
 
 ```json
 {
   "ok": true,
-  "status": "success",
-  "code": "真实的qq.login授权code",
-  "logoutStatus": "success",
-  "released": true
+  "code": "real-qq-login-code"
 }
 ```
 
-`logoutStatus=failed` 表示 code 已取得但 NapCat 注销失败；服务会阻止下一位用户开始工作流，直到自动重试注销成功。`login_required` 表示 QQ 尚未登录。
+响应不会包含登录任务、二维码图片、用户信息或内部小程序任务。`appId` 必须是长度
+3-128 位、仅包含 ASCII 字母、数字、下划线或短横线的字符串。
 
-## 错误码
-
-- `WORKFLOW_BUSY`：唯一 NapCat 正被其他浏览器使用；
-- `WORKFLOW_REQUIRED` / `LOGIN_REQUIRED`：尚未完成当前浏览器的扫码登录；
-- `LOGOUT_REQUIRED`：上一位用户注销未完成；
-- `404`：任务不存在，或任务属于其他浏览器 session；
-- `502`：NapCat、插件或 bridge 返回错误。
-
-## 内部 bridge 接口
-
-项目 Web 会调用本机 bridge，普通业务客户端不应直接暴露它：
+## 4. 取消任务或注销登录
 
 ```http
-POST /api/miniapp/login/start
-GET  /api/miniapp/login/status/{taskId}
 POST /api/qq/logout
-GET  /health
+Content-Type: application/json
+X-API-Signature: qq-miniapp-auth-default-signing-secret
+
+{"taskId":"login-task-id-or-miniapp-task-id"}
 ```
 
-bridge 默认监听 `127.0.0.1:9010`，可通过 `BRIDGE_TOKEN` 加 Bearer token。项目完全使用 HTTP，不需要 `BRIDGE_SOCKET`、Unix socket 或 Windows named pipe。
+对于等待扫码或已扫码的登录任务，接口会取消二维码任务。对于已经确认登录或小程序
+任务，接口会注销 QQ 并释放工作流。成功时只返回：
 
+```json
+{"ok":true}
+```
+
+此接口不会返回二维码图片或任务详情。
+
+已过期、已取消以及已经完成 code/注销的任务会立即从内存任务缓存中删除。之后再次使用
+旧任务 ID 时会统一返回 `TASK_EXPIRED`，本地不会保留失效任务数据。
+
+## 错误响应
+
+所有公开 API 错误仍然返回 HTTP `200`，并且 `ok` 为 `false`。
+
+签名缺失或错误时分别返回 `SIGNATURE_REQUIRED` 或 `INVALID_SIGNATURE`。
+
+对于 `/api/qq/miniapp/code` 和 `/api/qq/logout`，不存在或过期的任务不会返回任务详情：
+
+```json
+{
+  "ok": false,
+  "code": "TASK_EXPIRED",
+  "status": "expired",
+  "error": "Task not found or expired"
+}
+```
+
+- `WORKFLOW_BUSY`：已有其他任务正在占用唯一的 NapCat 工作流；
+- `LOGIN_REQUIRED`：提供的登录任务尚未确认；
+- `LOGOUT_REQUIRED`：上一位用户尚未完成 QQ 注销；
+- `TASK_EXPIRED`：任务 ID 不存在或任务已经过期；
+- 其他上游或参数校验错误也会通过 `ok: false` 返回。
+
+`GET /api/health` 是诊断接口，不属于四个业务接口，也不要求签名。bridge 接口属于
+内部接口，不是公开客户端 API。

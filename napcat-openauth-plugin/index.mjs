@@ -1,4 +1,6 @@
 import fs from "node:fs";
+import os from "node:os";
+import path from "node:path";
 
 function readConfig(ctx) {
   try {
@@ -29,7 +31,7 @@ function safeValue(value, seen = new WeakSet(), depth = 0) {
 function extractCode(value) {
   if (typeof value === "string") return value.trim();
   if (!value || typeof value !== "object") return "";
-  const direct = String(value.code || value.openCode || value.authCode || value.auth_code ||
+  const direct = String(value.code || value.authorizationCode || value.authorization_code || value.openCode || value.authCode || value.auth_code ||
     value.accessToken || value.token || value.openAuthCode || "").trim();
   if (direct) return direct;
   for (const key of ["result", "data", "value"]) {
@@ -41,7 +43,7 @@ function extractCode(value) {
 
 function getResultCode(value) {
   if (!value || typeof value !== "object") return 0;
-  const resultCode = Number(value.errCode ?? value.errorCode ?? 0);
+  const resultCode = Number(value.errCode ?? value.errorCode ?? value.resultCode ?? value.result?.errCode ?? value.result?.errorCode ?? 0);
   return Number.isFinite(resultCode) ? resultCode : 0;
 }
 
@@ -52,7 +54,7 @@ function getResultCode(value) {
 function extractOperationCode(operation, value) {
   if (operation === "loginWithAppId") {
     if (getResultCode(value) !== 0) return "";
-    return extractCode(value?.result);
+    return extractCode(value?.result) || extractCode(value);
   }
   return extractCode(value);
 }
@@ -66,12 +68,129 @@ function getMiscService(ctx) {
   return ctx?.core?.context?.session?.getNodeMiscService?.();
 }
 
-function getLoginService(ctx) {
+function inspectService(value) {
+  if (!value) return { available: false, methods: [] };
+  const names = new Set();
   try {
-    return ctx?.core?.context?.wrapper?.NodeIKernelLoginService?.get?.();
-  } catch {
-    return undefined;
+    for (const key of Object.keys(value)) names.add(key);
+  } catch {}
+  try {
+    let current = value;
+    let depth = 0;
+    while (current && current !== Object.prototype && depth++ < 4) {
+      for (const key of Object.getOwnPropertyNames(current)) names.add(key);
+      current = Object.getPrototypeOf(current);
+    }
+  } catch {}
+  const methods = [...names].filter((name) => {
+    try { return typeof value[name] === "function"; } catch { return false; }
+  }).sort();
+  return { available: true, methods };
+}
+
+function getLoginService(ctx) {
+  const candidates = [
+    ["session.getLoginService", () => ctx?.core?.context?.session?.getLoginService?.()],
+    ["core.context.wrapper.NodeIKernelLoginService.get", () => ctx?.core?.context?.wrapper?.NodeIKernelLoginService?.get?.()],
+    ["core.wrapper.NodeIKernelLoginService.get", () => ctx?.core?.wrapper?.NodeIKernelLoginService?.get?.()],
+    ["context.session.getLoginService", () => ctx?.context?.session?.getLoginService?.()],
+    ["context.wrapper.NodeIKernelLoginService.get", () => ctx?.context?.wrapper?.NodeIKernelLoginService?.get?.()],
+  ];
+  for (const [path, resolve] of candidates) {
+    try {
+      const service = resolve();
+      if (service) return { service, path };
+    } catch {}
   }
+  return { service: undefined, path: undefined };
+}
+
+function buildOfflineSessionArg(ctx, service) {
+  const core = ctx?.core;
+  const context = core?.context;
+  const selfInfo = core?.selfInfo || {};
+  const basicInfo = context?.basicInfoWrapper;
+  const platform = process.platform === "darwin" ? 4 : process.platform === "linux" ? 5 : 3;
+  const read = (resolve, fallback = "") => {
+    try {
+      const value = resolve();
+      return value === undefined || value === null ? fallback : value;
+    } catch {
+      return fallback;
+    }
+  };
+  const accountPath = String(read(() => core.dataPath, ""));
+  const clientVer = String(read(() => basicInfo?.getFullQQVersion?.(), ""));
+  const appid = String(read(() => basicInfo?.QQVersionAppid, ""));
+  const guid = String(read(() => service?.getMachineGuid?.(), ""));
+  const uin = String(selfInfo.uin || selfInfo.user_id || selfInfo.qq || "");
+  const uid = String(selfInfo.uid || selfInfo.userUid || "");
+  const platVer = process.platform === "win32" ? "Windows" : process.platform === "darwin" ? "macOS" : "Linux";
+  return {
+    selfUin: uin,
+    selfUid: uid,
+    desktopPathConfig: { account_path: accountPath },
+    clientVer,
+    a2: "",
+    d2: "",
+    d2Key: "",
+    machineId: "",
+    platform,
+    platVer,
+    appid,
+    rdeliveryConfig: {
+      appKey: "",
+      systemId: 0,
+      appId: "",
+      logicEnvironment: "",
+      platform,
+      language: "",
+      sdkVersion: "",
+      userId: "",
+      appVersion: "",
+      osVersion: "",
+      bundleId: "",
+      serverUrl: "",
+      fixedAfterHitKeys: [""]
+    },
+    defaultFileDownloadPath: path.join(accountPath, "NapCat", "temp"),
+    deviceInfo: {
+      guid,
+      buildVer: clientVer,
+      localId: 2052,
+      devName: os.hostname(),
+      devType: platVer,
+      vendorName: "",
+      osVer: platVer,
+      vendorOsName: platVer,
+      setMute: false,
+      vendorType: 0
+    },
+    deviceConfig: '{"appearance":{"isSplitViewMode":true},"msg":{}}'
+  };
+}
+
+function callLogout(service, ctx) {
+  for (const method of ["offline", "logout", "logOut", "signOut"]) {
+    try {
+      if (typeof service?.[method] === "function") return { method, promise: service[method]() };
+    } catch (error) {
+      return { method, error };
+    }
+  }
+  // NapCat 4.18.x does not expose LoginService.offline() from every QQ
+  // wrapper build, while the underlying wrapper session still provides the
+  // native account-session teardown methods.
+  const session = ctx?.core?.context?.session;
+  const sessionArg = buildOfflineSessionArg(ctx, service);
+  for (const method of ["offLine", "offLineSync"]) {
+    try {
+      if (typeof session?.[method] === "function") return { method: `WrapperSession.${method}`, promise: session[method](sessionArg) };
+    } catch (error) {
+      return { method: `WrapperSession.${method}`, error };
+    }
+  }
+  return undefined;
 }
 
 export async function plugin_init(ctx) {
@@ -88,11 +207,18 @@ export async function plugin_init(ctx) {
   ctx.router.getNoAuth("/status", async (req, res) => {
     if (!checkToken(req, res)) return;
     const service = getMiscService(ctx);
-    const loginService = getLoginService(ctx);
+    const login = getLoginService(ctx);
+    const loginService = login.service;
+    const inspected = inspectService(loginService);
+    const sessionInspected = inspectService(ctx?.core?.context?.session);
     res.json({
       ok: true,
       ready: Boolean(service),
-      logoutAvailable: typeof loginService?.offline === "function",
+      logoutAvailable: ["offline", "logout", "logOut", "signOut"].some((name) => inspected.methods.includes(name)) ||
+        ["offLine", "offLineSync"].some((name) => sessionInspected.methods.includes(name)),
+      logoutServicePath: login.path,
+      logoutMethods: inspected.methods.filter((name) => ["offline", "logout", "logOut", "signOut"].includes(name)),
+      logoutSessionMethods: sessionInspected.methods.filter((name) => ["offLine", "offLineSync"].includes(name)),
       methods: service ? ["getOpenAuth", "getOpenCodeWithAppId", "loginWithAppId", "checkSessionForMiniApp", "loginWXMiniApp", "getUserInfoWithAppId"].filter((name) => typeof service[name] === "function") : []
     });
   });
@@ -157,18 +283,29 @@ export async function plugin_init(ctx) {
     });
   });
 
-  // NodeIKernelLoginService.offline() is NapCat's native QQ account logout
-  // operation. It logs the QQ account off without stopping NapCat or QQNT.
+  // Prefer the login service when it is exported. NapCat 4.18.x builds may
+  // omit that service method while the native wrapper session still exposes
+  // offLine/offLineSync; callLogout() handles both paths.
   ctx.router.postNoAuth("/logout", async (req, res) => {
     if (!checkToken(req, res)) return;
-    const service = getLoginService(ctx);
-    if (!service || typeof service.offline !== "function") {
-      res.status(503).json({ ok: false, error: "NapCat NodeIKernelLoginService.offline is unavailable" });
+    const login = getLoginService(ctx);
+    const service = login.service;
+    const invocation = callLogout(service, ctx);
+    if (!invocation) {
+      const inspected = inspectService(service);
+      res.status(503).json({
+        ok: false,
+        error: "NapCat native logout methods are unavailable",
+        servicePath: login.path,
+        methods: inspected.methods
+      });
       return;
     }
     try {
-      const result = await service.offline();
-      res.json({ ok: true, loggedOut: true, method: "NodeIKernelLoginService.offline", result: safeValue(result) });
+      if (invocation.error) throw invocation.error;
+      const result = await invocation.promise;
+      const method = invocation.method.includes(".") ? invocation.method : `NodeIKernelLoginService.${invocation.method}`;
+      res.json({ ok: true, loggedOut: true, method, result: safeValue(result) });
     } catch (error) {
       res.status(502).json({ ok: false, error: error?.message || String(error) });
     }

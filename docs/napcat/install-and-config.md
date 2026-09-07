@@ -18,6 +18,13 @@
 3. 在 NapCat WebUI 中确认服务已启动，默认地址是 `http://127.0.0.1:6099/webui/`。
 4. 先单独确认 NapCat 能正常登录和退出 QQ，再接入本项目。
 
+本项目的自动注销有版本兼容回退：优先调用
+`NodeIKernelLoginService.offline()`；NapCat 4.18.x 或部分 QQ wrapper 没有
+该方法时，插件会构造当前账号的 session 配置并调用原生
+`NodeIQQNTWrapperSession.offLine()`。注销成功后，项目会请求 NapCat
+worker 重启并轮询 WebUI 的 `CheckLoginStatus`，确认 `isLogin=false` 后才
+向客户端返回小程序 code 或释放给下一位用户。
+
 平台文档中的项目安装步骤：
 
 - [Windows](../platforms/windows.md)
@@ -155,7 +162,11 @@ curl -H "Authorization: Bearer 插件token" \
 }
 ```
 
-`ready` 必须为 `true`，并且 `methods` 中应有 `loginWithAppId`。如果没有，检查插件目录层级、token 和 NapCat 重启状态。
+`ready` 必须为 `true`，并且 `methods` 中应有 `loginWithAppId`；
+`logoutAvailable` 必须为 `true`。当使用 wrapper 回退时，
+`logoutSessionMethods` 中通常会包含 `offLine` 或 `offLineSync`，这是正常
+现象，不需要额外安装旧的 QQNT 控制接口。如果这些字段不满足，检查插件
+目录层级、token 和 NapCat 重启状态。
 
 ## 5. 多 QQ 账号串行配置
 
@@ -170,8 +181,8 @@ NapCat 通常按 QQ 号保存 OneBot 配置：
 切换 QQ 的串行流程是：
 
 1. 用户 A 扫码登录并获取 code。
-2. 项目调用插件的 `offline()` 注销 A。
-3. 确认 NapCat 已回到未登录状态，再让用户 B 扫码。
+2. 项目调用插件的原生注销（`offline()` 或 `WrapperSession.offLine()`）。
+3. 项目请求 worker 重启并确认 NapCat 已回到未登录状态，再让用户 B 扫码。
 4. NapCat 会为 B 加载或生成 `onebot11_B.json`。
 
 如果切换后 OneBot 仍返回上一个 QQ，先在 NapCat WebUI 执行一次“重启 NapCat”，等待 WebUI 恢复后再开始下一次登录。不要同时运行第二个 NapCat。

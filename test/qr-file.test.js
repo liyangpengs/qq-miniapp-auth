@@ -13,6 +13,7 @@ await fs.writeFile(qrPath, Buffer.from(
 ));
 
 let loginChecks = 0;
+const signatureHeaders = { "X-API-Signature": "qq-miniapp-auth-default-signing-secret" };
 const upstream = http.createServer((request, response) => {
   if (request.url === "/get_login_info") {
     loginChecks += 1;
@@ -48,16 +49,19 @@ test("displays NapCat's real QR file without redirecting to WebUI", async (t) =>
   });
   const base = `http://127.0.0.1:${server.address().port}`;
 
-  const start = await fetch(`${base}/api/login/start`, { method: "POST", body: "{}" });
+  const start = await fetch(`${base}/api/qq/login/qrcode`, { method: "POST", body: "{}", headers: signatureHeaders });
   const body = await start.json();
-  const cookie = String(start.headers.get("set-cookie") || "").split(";", 1)[0];
   assert.equal(start.status, 200);
-  assert.equal(body.task.mode, "napcat-file");
+  assert.equal(body.task.type, "qq-login");
   assert.match(body.task.qrImage, /^data:image\/png;base64,/);
-  assert.equal(body.task.webuiUrl, undefined);
+  assert.equal(body.task.mode, undefined);
 
-  const status = await fetch(`${base}/api/login/status/${body.task.id}`, { headers: { Cookie: cookie } });
+  const status = await fetch(`${base}/api/qq/login/status`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json", ...signatureHeaders },
+    body: JSON.stringify({ taskId: body.task.id })
+  });
   const statusBody = await status.json();
-  assert.equal(statusBody.task.status, "success");
-  assert.equal(statusBody.task.user.user_id, 123456);
+  assert.equal(statusBody.task.status, "confirmed");
+  assert.equal("user" in statusBody.task, false);
 });

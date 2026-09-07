@@ -76,6 +76,18 @@ cd /opt/qq-miniapp-auth
 npm start
 ```
 
+也可以使用项目自带的后台启停脚本。该脚本会记录 PID，并将输出写入 `logs/qq-miniapp-auth.log`：
+
+```bash
+cd /opt/qq-miniapp-auth
+chmod +x start-stop.sh
+./start-stop.sh start
+./start-stop.sh status
+./start-stop.sh stop
+```
+
+支持 `start`、`stop`、`restart`、`status` 和 `logs` 命令。查看实时日志使用 `./start-stop.sh logs`。脚本默认在项目目录内保存 `qq-miniapp-auth.pid`；如需修改，可设置 `QQ_AUTH_PID_FILE` 和 `QQ_AUTH_LOG_FILE` 环境变量。
+
 服务只提供 API，不提供浏览器前端。使用健康检查确认服务已启动：
 
 ```bash

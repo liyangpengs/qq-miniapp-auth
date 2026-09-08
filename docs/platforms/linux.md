@@ -60,14 +60,11 @@ chmod 600 .env
 退出 QQ/NapCat 后，在项目根目录执行：
 
 ```bash
-mkdir -p "/path/to/NapCat/plugins/qq-miniapp-openauth"
-cp -R napcat-openauth-plugin/. "/path/to/NapCat/plugins/qq-miniapp-openauth/"
-mkdir -p "/path/to/NapCat/config/plugins/qq-miniapp-openauth"
+chmod +x install-napcat-plugin.sh
+./install-napcat-plugin.sh "/path/to/NapCat"
 ```
 
-先将 `/path/to/NapCat` 替换为实际 NapCat 目录，再执行命令。
-
-在 `config/plugins/qq-miniapp-openauth/config.json` 写入插件 token，并在 NapCat WebUI 插件管理中启用插件。若当前版本要求第三方插件白名单，按该版本 NapCat 官方方式启用 `qq-miniapp-openauth`。重启 NapCat 后验证 `/status`，具体响应见 [NapCat 文档](../napcat/install-and-config.md#4-验证插件)。
+先将 `/path/to/NapCat` 替换为实际 NapCat 目录，目录中必须包含 `napcat.mjs`。脚本会复制插件、生成或复用插件 token、启用插件，并为当前 NapCat 版本补充 `qq-miniapp-openauth` 白名单。重启 NapCat 后验证 `/status`，具体响应见 [NapCat 文档](../napcat/install-and-config.md#4-验证插件)。
 
 ## 手动启动
 

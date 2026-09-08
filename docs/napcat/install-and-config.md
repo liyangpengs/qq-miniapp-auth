@@ -122,25 +122,14 @@ Set-ExecutionPolicy -Scope Process Bypass
 
 ### Linux/macOS
 
-在 NapCat 完全退出时，把插件目录内容复制到 NapCat 的插件目录：
+在 NapCat 完全退出时，在项目根目录执行：
 
 ```bash
-mkdir -p "/path/to/NapCat/plugins/qq-miniapp-openauth"
-cp -R napcat-openauth-plugin/. "/path/to/NapCat/plugins/qq-miniapp-openauth/"
-mkdir -p "/path/to/NapCat/config/plugins/qq-miniapp-openauth"
+chmod +x install-napcat-plugin.sh
+./install-napcat-plugin.sh "/path/to/NapCat"
 ```
 
-先将 `/path/to/NapCat` 替换为实际 NapCat 目录，再执行命令。
-
-在 `config/plugins/qq-miniapp-openauth/config.json` 写入一个长随机 token，并把同一个值放入项目 `.env`：
-
-```json
-{
-  "token": "替换为长随机字符串"
-}
-```
-
-在 NapCat WebUI 的插件管理中启用 `qq-miniapp-openauth`。如果当前 NapCat 版本还要求第三方插件白名单，请按该版本官方方式启用此 ID；不要修改 QQ 的 `resources/app/package.json`。完成后重启 NapCat。
+先将 `/path/to/NapCat` 替换为实际 NapCat 目录，目录中必须包含 `napcat.mjs`。脚本会复制插件、生成或复用插件 token、启用插件，并为当前 NapCat 版本补充 `qq-miniapp-openauth` 白名单。完成后重启 NapCat。
 
 ## 4. 验证插件
 

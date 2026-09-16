@@ -54,7 +54,7 @@ POST /api/qq/login/qrcode
 
 响应中的 `task.id` 是后续请求使用的任务标识，不需要 cookie。四个公开业务接口始终
 返回 HTTP `200`，调用方通过 `ok` 字段判断成功或失败。二维码获取和状态查询接口返回
-任务对象，小程序 code 和注销接口只返回操作结果。
+任务对象，小程序 code 接口返回授权码及可用的 QQ 昵称，注销接口只返回操作结果。
 
 ```http
 POST /api/qq/login/status

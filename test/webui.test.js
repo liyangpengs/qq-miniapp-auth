@@ -72,5 +72,6 @@ test("uses NapCat WebUI endpoints for QR and current user", async (t) => {
   assert.equal(miniStart.status, 200);
   assert.equal(miniBody.ok, true);
   assert.equal(miniBody.code, "webui-mini-code");
+  assert.equal(miniBody.nickname, "测试账号");
   assert.equal("task" in miniBody, false);
 });

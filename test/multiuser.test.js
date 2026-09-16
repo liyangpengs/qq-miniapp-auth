@@ -79,6 +79,7 @@ test("serializes users and logs QQ out after a real mini-app code", async (t) =>
   assert.equal(miniStart.status, 200);
   assert.equal(miniBody.ok, true);
   assert.equal(miniBody.code, "serial-mini-code");
+  assert.equal(miniBody.nickname, "serial-user");
   assert.equal("task" in miniBody, false);
 
   const nextStart = await fetch(`${base}/api/qq/login/qrcode`, { method: "POST", headers: signatureHeaders });

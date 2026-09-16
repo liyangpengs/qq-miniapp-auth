@@ -142,6 +142,14 @@ function hasLoggedInUser(user) {
   return id !== undefined && id !== null && String(id).trim() !== "" && String(id) !== "0";
 }
 
+function extractUserNickname(user) {
+  if (user === undefined || user === null) return undefined;
+  const nickname = firstResultField(user, ["nickname", "nick", "nickName"]);
+  if (nickname === undefined || nickname === null) return undefined;
+  const value = String(nickname).trim();
+  return value || undefined;
+}
+
 function makeId() {
   return crypto.randomBytes(18).toString("hex");
 }
@@ -766,6 +774,7 @@ async function startMiniappThroughBridge(appId, ownerKey, workflow) {
       method: "POST",
       body: { appId, source: "qq-miniapp-auth" }
     });
+    const loginTask = workflow.loginTaskId ? tasks.get(workflow.loginTaskId) : undefined;
     const task = createTask("miniapp-login", {
       mode: "bridge",
       appId,
@@ -776,6 +785,7 @@ async function startMiniappThroughBridge(appId, ownerKey, workflow) {
       qrUrl: result.qrUrl || result.qr_url || result.url,
       qrImage: result.qrImage || result.qr_image,
       user: result.user,
+      nickname: extractUserNickname(result.nickname !== undefined ? result.nickname : result.user) || extractUserNickname(loginTask?.user),
       error: result.error || result.message
     }, ownerKey);
     workflow.miniappTaskId = task.id;
@@ -1012,6 +1022,7 @@ async function miniappStatus(task) {
       task.status = result.code ? "success" : mapStatus(result);
       task.code = result.code || task.code;
       task.user = result.user || task.user;
+      task.nickname = extractUserNickname(result.nickname !== undefined ? result.nickname : result.user) || task.nickname;
       task.qrUrl = result.qrUrl || result.qr_url || task.qrUrl;
       task.qrImage = result.qrImage || result.qr_image || task.qrImage;
       task.error = result.error || result.message;
@@ -1131,7 +1142,11 @@ function apiTaskPayload(task, ok = taskResponseOk(task)) {
 function miniappOperationPayload(task) {
   if (!task) return { ok: false, code: "TASK_EXPIRED", status: "expired" };
   if (task.status === "success" && task.code && task.logoutStatus === "success") {
-    return { ok: true, code: task.code };
+    return {
+      ok: true,
+      code: task.code,
+      ...(task.nickname ? { nickname: task.nickname } : {})
+    };
   }
   if (task.status === "success" && task.logoutStatus === "failed") {
     return { ok: false, code: "LOGOUT_FAILED", status: "failed", error: task.logoutError || "QQ logout failed" };

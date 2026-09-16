@@ -90,11 +90,13 @@ X-API-Signature: qq-miniapp-auth-default-signing-secret
 ```json
 {
   "ok": true,
-  "code": "real-qq-login-code"
+  "code": "real-qq-login-code",
+  "nickname": "QQ 用户昵称"
 }
 ```
 
-响应不会包含登录任务、二维码图片、用户信息或内部小程序任务。`appId` 必须是长度
+响应不会包含登录任务、二维码图片或内部小程序任务。`nickname` 为当前登录 QQ 账号的昵称；
+如果 NapCat 未返回昵称，则成功响应中不包含该字段。`appId` 必须是长度
 3-128 位、仅包含 ASCII 字母、数字、下划线或短横线的字符串。
 
 ## 4. 取消任务或注销登录
